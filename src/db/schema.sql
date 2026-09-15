@@ -130,6 +130,8 @@ CREATE TABLE IF NOT EXISTS routes (
   is_cancelled INTEGER DEFAULT 0,
   cancelled_by_official_id TEXT REFERENCES officials(id),
   cancelled_reason TEXT,
+  default_bus_id TEXT REFERENCES buses(id),
+  default_price REAL,
   created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -247,3 +249,28 @@ CREATE TABLE IF NOT EXISTS api_request_log (
   status_code INTEGER,
   created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- Diesel/fuel price index used by the pricing engine's fuel factor.
+-- Updated either by a super admin manually, or automatically by a cron job
+-- if FUEL_PRICE_API_URL is configured (see pricing.service.js). Keeping a
+-- history (not just one row) lets you audit how the index has moved.
+CREATE TABLE IF NOT EXISTS fuel_price_index (
+  id TEXT PRIMARY KEY,
+  price_per_liter REAL NOT NULL,
+  source TEXT DEFAULT 'manual',
+  updated_by_official_id TEXT REFERENCES officials(id),
+  created_at TEXT DEFAULT (datetime('now'))
+);
+-- ==========================================================
+-- ON-ROUTE SEARCH SUPPORT 
+-- ==========================================================
+
+CREATE TABLE IF NOT EXISTS picked_points (
+  id                TEXT PRIMARY KEY,
+  name              TEXT,
+  lat               REAL NOT NULL,
+  lng               REAL NOT NULL,
+  formatted_address TEXT,
+  created_at        TEXT DEFAULT (datetime('now'))
+);
+

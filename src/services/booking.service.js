@@ -27,8 +27,15 @@ function getSeatMap(tripId) {
 /**
  * Step 1: hold seats (Redis lock) + create a pending booking + Razorpay order.
  * source: 'web' or `partner:<partnerId>`
+ *
+ * Optional on-route pickup: pass boardingLat/boardingLng/boardingName and
+ * droppingLat/droppingLng/droppingName for map-picked points that aren't
+ * official stops. They're stored on the booking so the driver sees them.
  */
-async function initiateBooking({ userId, tripId, seatIds, boardingStopId, droppingStopId, source }) {
+async function initiateBooking({
+  userId, tripId, seatIds, boardingStopId, droppingStopId, source,
+  boardingLat, boardingLng, droppingLat, droppingLng, boardingName, droppingName,
+}) {
   const trip = db.prepare(`SELECT * FROM trips WHERE id = ?`).get(tripId);
   if (!trip) throw Object.assign(new Error('Trip not found'), { status: 404 });
   if (trip.status === 'cancelled') throw Object.assign(new Error('Trip cancelled'), { status: 409 });
@@ -56,9 +63,16 @@ async function initiateBooking({ userId, tripId, seatIds, boardingStopId, droppi
   const bookingId = uuidv4();
 
   db.prepare(
-    `INSERT INTO bookings (id, user_id, trip_id, boarding_stop_id, dropping_stop_id, status, total_amount, source)
-     VALUES (?, ?, ?, ?, ?, 'pending_payment', ?, ?)`
-  ).run(bookingId, userId, tripId, boardingStopId, droppingStopId, totalAmount, source || 'web');
+    `INSERT INTO bookings
+      (id, user_id, trip_id, boarding_stop_id, dropping_stop_id, status, total_amount, source,
+       boarding_lat, boarding_lng, dropping_lat, dropping_lng, boarding_name, dropping_name)
+     VALUES (?, ?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    bookingId, userId, tripId, boardingStopId || null, droppingStopId || null,
+    totalAmount, source || 'web',
+    boardingLat ?? null, boardingLng ?? null, droppingLat ?? null, droppingLng ?? null,
+    boardingName ?? null, droppingName ?? null
+  );
 
   const order = await razorpay.createOrder(totalAmount, bookingId);
 
@@ -93,7 +107,6 @@ async function confirmBooking({ bookingId, holderId, seatIds, razorpay_order_id,
 
   const tx = db.transaction((seats) => {
     for (const seatId of seats) {
-      // UNIQUE(trip_id, seat_id) throws if somehow already booked -> guarantees no double-booking
       insertSeat.run(uuidv4(), bookingId, booking.trip_id, seatId, trip.current_price);
     }
     db.prepare(`UPDATE bookings SET status = 'confirmed', updated_at = datetime('now') WHERE id = ?`).run(bookingId);
@@ -105,7 +118,6 @@ async function confirmBooking({ bookingId, holderId, seatIds, razorpay_order_id,
   try {
     tx(seatIds);
   } catch (e) {
-    // Someone else's booking hit the UNIQUE constraint first -> refund immediately.
     db.prepare(`UPDATE bookings SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`).run(bookingId);
     throw Object.assign(new Error('Seat conflict at final confirmation — refund will be issued'), { status: 409 });
   } finally {
@@ -113,6 +125,20 @@ async function confirmBooking({ bookingId, holderId, seatIds, razorpay_order_id,
   }
 
   return { bookingId, status: 'confirmed' };
+}
+
+/**
+ * Release pending booking + Redis locks when the user cancels checkout.
+ */
+async function releaseBooking({ bookingId, holderId }) {
+  const booking = db.prepare(`SELECT * FROM bookings WHERE id = ?`).get(bookingId);
+  if (!booking) return { released: false, reason: 'booking not found' };
+  if (booking.status !== 'pending_payment') return { released: false, reason: `booking is ${booking.status}` };
+
+  const released = await seatLock.releaseAllHeldBy(booking.trip_id, holderId);
+
+  db.prepare(`UPDATE bookings SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`).run(bookingId);
+  return { released: true, releasedCount: released };
 }
 
 /**
@@ -139,4 +165,28 @@ async function cancelBooking(bookingId) {
   return { bookingId, refundAmount: refundAmountRupees, refundPercent: 75 };
 }
 
-module.exports = { getSeatMap, initiateBooking, confirmBooking, cancelBooking };
+async function sweepStalePendingBookings() {
+  const stale = db.prepare(
+    `SELECT id FROM bookings
+     WHERE status = 'pending_payment'
+       AND updated_at < datetime('now', '-1 minutes')`
+  ).all();
+
+  if (stale.length === 0) return 0;
+
+  const update = db.prepare(
+    `UPDATE bookings SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`
+  );
+  const tx = db.transaction((ids) => { for (const id of ids) update.run(id); });
+  try { tx(stale.map(r => r.id)); } catch (e) { console.error('[sweep]', e.message); return 0; }
+  return stale.length;
+}
+
+module.exports = {
+  getSeatMap,
+  initiateBooking,
+  confirmBooking,
+  releaseBooking,
+  cancelBooking,
+  sweepStalePendingBookings,
+};

@@ -15,6 +15,13 @@
   <div id="list"></div>
 </div>
 
+<div id="detailModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000;">
+  <div style="background:#fff; margin:5vh auto; width:92%; max-width:560px; max-height:88vh; overflow-y:auto; border-radius:10px; padding:22px; position:relative;">
+    <button onclick="closeDetail()" aria-label="Close" style="position:absolute; top:12px; right:14px; width:auto; background:transparent; color:var(--muted); border:none; font-size:22px; box-shadow:none;">×</button>
+    <div id="detailBody"></div>
+  </div>
+</div>
+
 <script src="/js/common.js"></script>
 <script>
 if (!requireUserAuth()) { /* redirected */ }
@@ -44,7 +51,7 @@ function renderBooking(b) {
     completed: '<span class="badge">Completed</span>',
   }[b.status] || '';
 
-  return `<div class="card">
+  return `<div class="card" style="cursor:pointer;" onclick="openDetail('${b.booking_id}', event)">
     <div style="display:flex; justify-content:space-between; align-items:flex-start;">
       <div>
         <strong>${b.origin_name} → ${b.dest_name}</strong><br>
@@ -56,16 +63,62 @@ function renderBooking(b) {
         ${b.refund_amount ? `<small>Refunded ₹${b.refund_amount}</small>` : ''}
       </div>
     </div>
-    <div style="margin-top:12px; display:flex; gap:8px;">
+    <div style="margin-top:12px; display:flex; gap:8px;" onclick="event.stopPropagation()">
       ${b.status === 'confirmed' && b.trip_status === 'live'
         ? `<button class="secondary small" onclick="location.href='/track.html?tripId=${b.trip_id}'">Track live location</button>`
         : ''}
       ${b.status === 'confirmed'
         ? `<button class="danger small" onclick="cancelBooking('${b.booking_id}', this)">Cancel booking</button>`
         : ''}
+      <button class="secondary small" onclick="openDetail('${b.booking_id}')">Ticket details</button>
     </div>
   </div>`;
 }
+
+/* ---------- Ticket detail modal: bus no, driver, route, stops, seat matrix, live location ---------- */
+async function openDetail(bookingId) {
+  const modal = document.getElementById('detailModal');
+  const body = document.getElementById('detailBody');
+  modal.style.display = 'block';
+  body.innerHTML = `<p style="color:var(--muted);">Loading ticket…</p>`;
+  try {
+    const d = await api(`/api/bookings/${bookingId}`);
+    const seatHtml = d.seatMatrix.map(s =>
+      `<div class="seat${s.mine ? ' selected' : s.booked ? ' booked' : ''}" title="${s.seat_number}">${s.seat_number}</div>`
+    ).join('');
+    const stopsHtml = d.route.stops.length
+      ? `<ul class="stop-list">${d.route.stops.map(s => `<li>${s.name}${s.eta_offset_min != null ? ` — +${s.eta_offset_min} min` : ''}</li>`).join('')}</ul>`
+      : `<p style="color:var(--muted); font-size:0.85rem;">No intermediate stops on this route.</p>`;
+    const liveHtml = d.currentLocation
+      ? `<p>📍 Last known position: ${d.currentLocation.lat.toFixed(5)}, ${d.currentLocation.lng.toFixed(5)}
+          ${d.currentLocation.speed_kmph != null ? ` · ${Math.round(d.currentLocation.speed_kmph)} km/h` : ''}
+          <br><small style="color:var(--muted);">Updated ${new Date(d.currentLocation.recorded_at).toLocaleTimeString()}</small>
+          ${d.trip.status === 'live' ? `<br><button class="small" style="margin-top:8px;" onclick="location.href='/track.html?tripId=${d.trip.id}'">Open live map →</button>` : ''}</p>`
+      : `<p style="color:var(--muted); font-size:0.9rem;">No live position yet — the driver hasn't started sharing GPS for this trip.</p>`;
+
+    body.innerHTML = `
+      <h2 style="margin-top:0;">${d.bus.registration_number} <span class="badge">${d.bus.bus_type}</span></h2>
+      <p class="subtitle" style="margin-top:-4px;">${d.bus.operator_name || 'Operator'} · ${d.route.origin.name} → ${d.route.destination.name}</p>
+      <div class="grid-2">
+        <div><label style="margin-top:0;">Driver</label><p>${d.driver ? `${d.driver.name}${d.driver.phone ? ' · ' + d.driver.phone : ''}` : 'Not assigned yet'}</p></div>
+        <div><label style="margin-top:0;">Departs</label><p>${d.trip.travel_date} at ${d.trip.departure_time}</p></div>
+      </div>
+      <label>Route stops (in order)</label>
+      ${stopsHtml}
+      <label>Seat matrix</label>
+      <div class="seat-grid">${seatHtml}</div>
+      <div style="display:flex; gap:14px; font-size:0.78rem; color:var(--muted); margin-top:4px;">
+        <span><span class="seat selected" style="display:inline-block; width:14px; height:14px; vertical-align:middle;"></span> Your seat(s)</span>
+        <span><span class="seat booked" style="display:inline-block; width:14px; height:14px; vertical-align:middle;"></span> Booked by others</span>
+      </div>
+      <label>Live location</label>
+      ${liveHtml}
+    `;
+  } catch (e) {
+    body.innerHTML = `<div class="status-msg error">${e.message}</div>`;
+  }
+}
+function closeDetail() { document.getElementById('detailModal').style.display = 'none'; }
 
 async function cancelBooking(bookingId, btn) {
   if (!confirm('Cancel this booking? You will receive a 75% refund of the fare paid.')) return;

@@ -2,6 +2,7 @@ const express = require('express');
 const { v4: uuidv4 } = require('uuid');
 const db = require('../db/init');
 const maps = require('../services/googleMaps.service');
+const polylineSvc = require('../services/polyline.service');
 
 const router = express.Router();
 
@@ -85,6 +86,75 @@ router.get('/route-preview', async (req, res) => {
     console.error('[places/route-preview]', e.message);
     res.status(502).json({ error: 'Route lookup failed', detail: e.message });
   }
+});
+
+// ---------- Transfer-point suggestions ----------
+// Given a picked point (typed name, autocomplete result, or map click),
+// finds existing locations within `radiusM` that are ALREADY used as the
+// origin, destination, or an intermediate stop of some other active route.
+// Route-change ("connecting") search only links two routes at a shared stop
+// if both routes point at the EXACT SAME locations row (or one within 300m —
+// see routeSearch.service.js's samePhysical()). Two officials independently
+// typing "Santragachi" can easily end up with two different rows a few
+// hundred metres apart, silently breaking that link. This endpoint lets the
+// route-builder UI say "hey, this looks like a stop that already exists on
+// route X — reuse it" instead of creating a near-duplicate.
+router.get('/transfer-suggestions', (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  const radiusM = Number(req.query.radiusM) || 500;
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return res.status(400).json({ error: 'lat and lng required' });
+  }
+
+  // Coarse bounding box first (cheap, uses the index-free lat/lng columns),
+  // then refine with real haversine distance — better-sqlite3/SQLite has no
+  // built-in trig functions.
+  const degPad = radiusM / 111000; // ~111km per degree of latitude
+  const candidates = db.prepare(
+    `SELECT * FROM locations WHERE lat BETWEEN ? AND ? AND lng BETWEEN ? AND ? AND lat IS NOT NULL AND lng IS NOT NULL`
+  ).all(lat - degPad, lat + degPad, lng - degPad, lng + degPad);
+
+  const nearby = candidates
+    .map((l) => ({ ...l, distanceM: polylineSvc.haversineM({ lat, lng }, { lat: l.lat, lng: l.lng }) }))
+    .filter((l) => l.distanceM <= radiusM)
+    .sort((a, b) => a.distanceM - b.distanceM)
+    .slice(0, 10);
+
+  const suggestions = [];
+  for (const loc of nearby) {
+    const asOrigin = db.prepare(
+      `SELECT r.id, r.route_code, o.name as origin_name, d.name as destination_name
+       FROM routes r JOIN locations o ON o.id = r.origin_location_id JOIN locations d ON d.id = r.destination_location_id
+       WHERE r.origin_location_id = ? AND r.is_cancelled = 0`
+    ).all(loc.id).map((r) => ({ ...r, role: 'origin' }));
+
+    const asDest = db.prepare(
+      `SELECT r.id, r.route_code, o.name as origin_name, d.name as destination_name
+       FROM routes r JOIN locations o ON o.id = r.origin_location_id JOIN locations d ON d.id = r.destination_location_id
+       WHERE r.destination_location_id = ? AND r.is_cancelled = 0`
+    ).all(loc.id).map((r) => ({ ...r, role: 'destination' }));
+
+    const asStop = db.prepare(
+      `SELECT r.id, r.route_code, o.name as origin_name, d.name as destination_name
+       FROM route_stops rs
+       JOIN routes r ON r.id = rs.route_id
+       JOIN locations o ON o.id = r.origin_location_id
+       JOIN locations d ON d.id = r.destination_location_id
+       WHERE rs.location_id = ? AND r.is_cancelled = 0`
+    ).all(loc.id).map((r) => ({ ...r, role: 'stop' }));
+
+    const routes = [...asOrigin, ...asDest, ...asStop];
+    if (routes.length > 0) {
+      suggestions.push({
+        location: { id: loc.id, name: loc.name, lat: loc.lat, lng: loc.lng },
+        distanceM: Math.round(loc.distanceM),
+        routes,
+      });
+    }
+  }
+
+  res.json({ suggestions });
 });
 
 module.exports = router;

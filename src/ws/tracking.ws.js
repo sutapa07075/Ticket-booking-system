@@ -61,12 +61,22 @@ function attach(server) {
           `INSERT INTO trip_locations (id, trip_id, lat, lng, speed_kmph, heading) VALUES (?, ?, ?, ?, ?, ?)`
         ).run(uuidv4(), tripId, lat, lng, speed || null, heading || null);
 
-        await redis.set(
-          `live:${tripId}`,
-          JSON.stringify({ lat, lng, speed, heading, ts: Date.now() }),
-          'EX',
-          120
-        );
+        // Redis is only a cache for the REST polling fallback (GET /api/tracking/:id/latest)
+        // — if it's unreachable/unconfigured, that must NOT block the actual live
+        // WebSocket push below. Previously this `await` had no try/catch, so a
+        // Redis failure silently aborted the whole handler before the fan-out
+        // ever ran — passengers received nothing even though the driver's
+        // message was sent successfully.
+        try {
+          await redis.set(
+            `live:${tripId}`,
+            JSON.stringify({ lat, lng, speed, heading, ts: Date.now() }),
+            'EX',
+            120
+          );
+        } catch (e) {
+          console.warn('[tracking] Redis cache write failed (live push continues regardless):', e.message);
+        }
 
         // Fan out to all subscribed passengers instantly
         const subs = tripSubscribers.get(tripId);

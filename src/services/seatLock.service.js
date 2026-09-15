@@ -7,8 +7,9 @@ const redis = require('../config/redis');
  *
  * Strategy: a short-lived Redis lock per seat, acquired atomically with
  * SET key value NX PX <ttl>. Only the holder can confirm the booking;
- * the lock is released on success (converted into a permanent DB row)
- * or expires automatically if the user abandons checkout.
+ * the lock is released on success (converted into a permanent DB row),
+ * explicitly released when the user cancels, or expires automatically if
+ * the user abandons checkout without notice.
  */
 
 const LOCK_TTL_MS = 5 * 60 * 1000; // 5 min hold while user pays
@@ -55,9 +56,28 @@ async function releaseSeats(tripId, seatIds, holderId) {
   }
 }
 
+/**
+ * Release every seat lock on this trip held by `holderId`.
+ * Used when the client abandons checkout and only knows its holderId
+ * (e.g. after a page refresh where seatIds weren't persisted).
+ */
+async function releaseAllHeldBy(tripId, holderId) {
+  const pattern = `seatlock:${tripId}:*`;
+  const keys = await redis.keys(pattern);
+  let released = 0;
+  for (const key of keys) {
+    const owner = await redis.get(key);
+    if (owner === holderId) {
+      await redis.del(key);
+      released++;
+    }
+  }
+  return released;
+}
+
 async function isLockedByOther(tripId, seatId, holderId) {
   const owner = await redis.get(seatKey(tripId, seatId));
   return owner && owner !== holderId;
 }
 
-module.exports = { lockSeats, releaseSeats, isLockedByOther, LOCK_TTL_MS };
+module.exports = { lockSeats, releaseSeats, releaseAllHeldBy, isLockedByOther, LOCK_TTL_MS };

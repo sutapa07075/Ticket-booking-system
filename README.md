@@ -225,15 +225,48 @@ POST /api/partner/booking/initiate     { userPhone, tripId, seatIds[] }         
 POST /api/partner/booking/confirm      { ... razorpay fields }                    [x-api-key/secret]
 ```
 
-## 5. Things could not be Implemented
+## 6. Recurring / fixed-bus schedules
 
-- **Weather & fuel-price factors** in pricing are stubbed at neutral (1.0) —
-  wire up a real weather API (OpenWeather etc.) and a fuel-price feed to
-  make them live.
+When creating a route, an official can optionally set a **fixed bus** and a
+**default price**. Combined with the operating-days schedule, this means
+trips no longer need to be created manually every single day — search
+auto-generates ("materializes") the day's trip the first time someone
+searches that date, using the fixed bus and applying dynamic pricing
+immediately. A bus already committed to an overlapping trip is never
+double-booked — `busAvailability.service.js` checks for time-window overlap
+(using each route's `base_duration_min`, defaulting to 4 hours if unset)
+before creating any trip, whether auto-generated or manually scheduled by
+an official.
+
+## 7. Fuel price & weather in dynamic pricing
+
+- **Weather**: real calls to [Open-Meteo](https://open-meteo.com) (free, no
+  API key) using the route's origin coordinates — rain/storm/fog/extreme
+  heat mildly raise price. Fails safe to a neutral multiplier if the API is
+  unreachable.
+- **Fuel price**: there's no single reliable free-without-signup Indian fuel
+  price API, so this is a configurable index (`fuel_price_index` table) a
+  super admin updates manually via the dashboard's "Fuel price index" panel
+  — or, if you find/build a real feed, point `FUEL_PRICE_API_URL` at it in
+  `.env` and the pricing cron will auto-refresh it every 30 minutes.
+
+## 8. Known simplification: sub-route fares
+
+Searching a sub-segment of a route (e.g. Durgapur → Santragachi on a
+Durgapur → Kolkata route) correctly finds and shows the trip, but the price
+shown is currently the **full route's** current price, not a
+distance-prorated fare for just that segment. Proportional fares based on
+stop-to-stop distance would be a reasonable next step if needed.
+
+## 9. Honest scope notes (for a student project, be upfront about these)
+
 - **Face-match** for KYC is a stub returning "manual review required" — real
   biometric face-match needs a licensed provider.
-- **API Setu sandbox** returns test/mock data, not real government
-  verification — correct for a demo, not for production KYC.
+- **API Setu sandbox** — real government sandbox access requires registering
+  as an approved API consumer, not instant signup, so this defaults to
+  `APISETU_MOCK_MODE=true` (basic PAN/Aadhaar format validation, no real
+  network call) so the KYC flow is fully testable end-to-end. Switch to
+  real credentials any time by setting it to `false`.
 - The partner-auth lookup scans approved partners and bcrypt-compares each
   (fine at small scale for a student project); at real scale, look up by a
   non-hashed key prefix first.

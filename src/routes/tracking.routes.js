@@ -4,10 +4,14 @@ const redis = require('../config/redis');
 
 const router = express.Router();
 
-// Latest known position (fast path via Redis cache)
+// Latest known position (fast path via Redis cache, falls back to SQLite if Redis is unavailable)
 router.get('/:tripId/latest', async (req, res) => {
-  const cached = await redis.get(`live:${req.params.tripId}`);
-  if (cached) return res.json(JSON.parse(cached));
+  try {
+    const cached = await redis.get(`live:${req.params.tripId}`);
+    if (cached) return res.json(JSON.parse(cached));
+  } catch (e) {
+    console.warn('[tracking] Redis read failed, falling back to DB:', e.message);
+  }
 
   const row = db
     .prepare(`SELECT lat, lng, speed_kmph, heading, recorded_at FROM trip_locations WHERE trip_id = ? ORDER BY recorded_at DESC LIMIT 1`)

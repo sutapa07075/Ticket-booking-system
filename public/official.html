@@ -90,6 +90,16 @@
         <h2>Trips</h2>
         <div id="tripsTable"><p class="empty-state">Loading…</p></div>
       </div>
+      <div class="card" id="fuelPriceCard" style="display:none;">
+        <h2>Fuel price index</h2>
+        <p class="subtitle">Feeds the dynamic pricing engine's fuel factor. Super admin only.</p>
+        <div id="fuelPriceCurrent" style="margin-bottom:10px; font-size:0.9rem; color:var(--muted);">Loading…</div>
+        <div class="grid-2">
+          <div><label>New price (₹/liter)</label><input id="fuelPriceInput" type="number" step="0.1" placeholder="e.g. 94.5" /></div>
+          <div style="display:flex; align-items:flex-end;"><button onclick="updateFuelPrice()">Update fuel price</button></div>
+        </div>
+        <div id="fuelPriceMsg"></div>
+      </div>
     </div>
 
     <div id="tab-drivers" class="tab-content" style="display:none;">
@@ -142,20 +152,38 @@
           <label>Origin</label>
           <input id="rOriginInput" placeholder="Start typing…" autocomplete="off" />
           <div id="rOriginSuggestions" class="suggestions"></div>
+          <button type="button" class="pick-btn" onclick="openRouteMapPicker('origin')">📍 Pick exact point on map</button>
+          <span class="picked-badge" id="rOriginPickedBadge"></span>
+          <div id="rOriginTransferHint"></div>
         </div>
-        <div class="autocomplete-wrap">
+
+        <label>Intermediate stops <span style="font-weight:400;">(optional, in order — the route's road-polyline is built to pass through these exactly, so search finds pickups near them)</span></label>
+        <div id="stopsContainer"></div>
+        <button type="button" class="secondary small" onclick="addStopRow()">+ Add a stop</button>
+
+        <div class="autocomplete-wrap" style="margin-top:14px;">
           <label>Destination</label>
           <input id="rDestInput" placeholder="Start typing…" autocomplete="off" />
           <div id="rDestSuggestions" class="suggestions"></div>
+          <button type="button" class="pick-btn" onclick="openRouteMapPicker('destination')">📍 Pick exact point on map</button>
+          <span class="picked-badge" id="rDestPickedBadge"></span>
+          <div id="rDestTransferHint"></div>
         </div>
         <div class="grid-2">
           <div><label>Distance (km, optional)</label><input id="rDistance" type="number" /></div>
           <div><label>Base duration (minutes, optional)</label><input id="rDuration" type="number" /></div>
         </div>
-        <label>Operating days</label>
+
+        <label>Operating days <span style="font-weight:400;">(check the days this route runs)</span></label>
         <div id="daysCheckboxes" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
         <label>Departure time</label>
         <input id="rDeparture" type="time" value="08:00" />
+
+        <label>Fixed bus for this schedule <span style="font-weight:400;">(optional — if set, trips are created automatically on each operating day, no need to schedule one manually every time)</span></label>
+        <select id="rDefaultBus"><option value="">— none, I'll schedule trips manually —</option></select>
+        <label>Default price for auto-created trips (₹) <span style="font-weight:400;">(used only if a fixed bus is set above)</span></label>
+        <input id="rDefaultPrice" type="number" value="500" />
+
         <button onclick="createRoute()">Create route</button>
         <div id="routeMsg"></div>
       </div>
@@ -197,7 +225,31 @@
   </div>
 </div>
 
+<!-- ============ Route map-pick modal (exact coordinates, no geocoding needed) ============ -->
+<div id="routeMapModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.6); z-index:1000;">
+  <div style="background:#fff; margin:5vh auto; width:90%; max-width:820px; height:80vh; border-radius:8px; overflow:hidden; display:flex; flex-direction:column;">
+    <div style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center; border-bottom:1px solid #eee;">
+      <strong>Pick exact point</strong>
+      <button onclick="closeRouteMapPicker()" aria-label="Close" style="border:0; background:transparent; font-size:20px; cursor:pointer; width:auto; box-shadow:none;">×</button>
+    </div>
+    <div id="routePickerMap" style="flex:1; background:#eee;"></div>
+    <div style="padding:10px 14px; display:flex; justify-content:space-between; align-items:center; border-top:1px solid #eee;">
+      <span id="routePickedLabel" style="font-size:0.9rem; color:#666;">Click on the map to choose the exact point</span>
+      <button id="routeConfirmPickBtn" onclick="confirmRouteMapPick()" disabled style="width:auto;">Use this point</button>
+    </div>
+  </div>
+</div>
+
 <script src="/js/common.js"></script>
+<script src="/js/config.js"></script>
+<script>
+  window.__officialMapsReady = false;
+  function initOfficialMaps() { window.__officialMapsReady = true; }
+  const officialGmapScript = document.createElement('script');
+  officialGmapScript.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_BROWSER_KEY}&callback=initOfficialMaps&loading=async`;
+  officialGmapScript.async = true; officialGmapScript.defer = true;
+  document.body.appendChild(officialGmapScript);
+</script>
 <script>
 if (Auth.getOfficialToken()) showDashboard(); else buildDaysCheckboxes();
 
@@ -276,6 +328,7 @@ function showTab(name) {
   if (name === 'overview') loadOverview();
   if (name === 'buses') populateDriverPicker();
   if (name === 'trips' || name === 'manage') populateRouteBusPickers();
+  if (name === 'routes') populateDefaultBusPicker();
 }
 
 function copyId(id, btn) {
@@ -299,19 +352,54 @@ async function overrideKyc(driverId, status) {
   } catch (e) { alert(e.message); }
 }
 
+async function deleteDriver(driverId) {
+  if (!confirm('Delete this driver permanently? This cannot be undone.')) return;
+  try {
+    await api(`/api/official/drivers/${driverId}`, { method: 'DELETE' }, 'official');
+    loadOverview();
+  } catch (e) { alert(e.message); }
+}
+
+async function loadFuelPrice() {
+  try {
+    const { latest } = await api('/api/official/fuel-price', {}, 'official');
+    document.getElementById('fuelPriceCurrent').innerText = latest
+      ? `Current: ₹${latest.price_per_liter}/L (source: ${latest.source}, updated ${latest.created_at})`
+      : 'No fuel price on record yet — pricing engine is using a neutral fuel factor until you set one.';
+  } catch (e) { /* ignore */ }
+}
+
+async function updateFuelPrice() {
+  const msg = document.getElementById('fuelPriceMsg');
+  const price = Number(document.getElementById('fuelPriceInput').value);
+  if (!price || price <= 0) { statusMsg(msg, 'Enter a valid price.', 'error'); return; }
+  try {
+    const data = await api('/api/official/fuel-price', { method: 'POST', body: JSON.stringify({ price_per_liter: price }) }, 'official');
+    statusMsg(msg, data.message, 'success');
+    loadFuelPrice();
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
 /* ---------- Overview tab: everything you've created, with copy buttons ---------- */
 async function loadOverview() {
+  const official = Auth.getOfficial();
+  if (official.role === 'super_admin') {
+    document.getElementById('fuelPriceCard').style.display = 'block';
+    loadFuelPrice();
+  }
+
   try {
     const { drivers } = await api('/api/official/drivers', {}, 'official');
     document.getElementById('driversTable').innerHTML = drivers.length === 0
       ? `<p class="empty-state">No drivers registered yet.</p>`
-      : `<table><tr><th>Name</th><th>Phone</th><th>KYC</th><th>ID</th><th>Override</th></tr>${drivers.map(d => `
+      : `<table><tr><th>Name</th><th>Phone</th><th>KYC</th><th>ID</th><th>Actions</th></tr>${drivers.map(d => `
           <tr><td>${d.name}</td><td>${d.phone}</td>
           <td><span class="badge ${d.kyc_status === 'verified' ? 'green' : d.kyc_status === 'rejected' ? 'red' : 'amber'}">${d.kyc_status}</span></td>
           <td>${idChip(d.id)}</td>
-          <td>
-            ${d.kyc_status !== 'verified' ? `<button class="small secondary" onclick="overrideKyc('${d.id}','verified')">Mark verified</button>` : ''}
-            ${d.kyc_status !== 'rejected' ? `<button class="small danger" onclick="overrideKyc('${d.id}','rejected')">Mark rejected</button>` : ''}
+          <td style="white-space:nowrap;">
+            ${d.kyc_status !== 'verified' ? `<button class="small secondary" onclick="overrideKyc('${d.id}','verified')">Verify</button>` : ''}
+            ${d.kyc_status !== 'rejected' ? `<button class="small secondary" onclick="overrideKyc('${d.id}','rejected')">Reject</button>` : ''}
+            <button class="small danger" onclick="deleteDriver('${d.id}')">Delete</button>
           </td></tr>`).join('')}</table>`;
   } catch (e) { document.getElementById('driversTable').innerHTML = `<p class="empty-state">${e.message}</p>`; }
 
@@ -402,15 +490,169 @@ async function registerBus() {
 
 /* ---------- Route creation (with location autocomplete, falls back to manual entry) ---------- */
 let rOrigin = null, rDest = null;
+let stopRows = []; // array of { location: {...} | null }, in order
+
 function wireRouteAutocomplete() {
-  wireAutocompleteWithFallback('rOriginInput', 'rOriginSuggestions', loc => rOrigin = loc);
-  wireAutocompleteWithFallback('rDestInput', 'rDestSuggestions', loc => rDest = loc);
+  wireAutocompleteWithFallback('rOriginInput', 'rOriginSuggestions', loc => {
+    rOrigin = loc;
+    checkTransferSuggestion(loc, (picked) => { rOrigin = picked; document.getElementById('rOriginInput').value = picked.name; }, 'rOriginTransferHint');
+  });
+  wireAutocompleteWithFallback('rDestInput', 'rDestSuggestions', loc => {
+    rDest = loc;
+    checkTransferSuggestion(loc, (picked) => { rDest = picked; document.getElementById('rDestInput').value = picked.name; }, 'rDestTransferHint');
+  });
+}
+
+/* ---------- Transfer-point suggestions ----------
+   Whenever a location is picked for a route's origin/stop/destination, check
+   if there's already an existing location nearby that's used on another
+   active route — and if so, offer to reuse that exact record. Route-change
+   search only links two routes at a shared stop when they point at the SAME
+   locations row (or one within 300m), so reusing here is what actually makes
+   "board Bus 1, change to Bus 2 at Santragachi" work reliably instead of
+   silently failing because two officials typed slightly different points. */
+async function checkTransferSuggestion(loc, applyFn, hintElId) {
+  const hintEl = document.getElementById(hintElId);
+  if (!hintEl) return;
+  if (!loc || loc.lat == null || loc.lng == null) { hintEl.innerHTML = ''; return; }
+  hintEl.innerHTML = '';
+  try {
+    const { suggestions } = await api(`/api/places/transfer-suggestions?lat=${loc.lat}&lng=${loc.lng}&radiusM=500`);
+    const match = suggestions.find(s => s.location.id !== loc.id);
+    if (!match) return;
+    const routeNames = [...new Set(match.routes.map(r => `${r.origin_name} → ${r.destination_name}`))];
+    const shown = routeNames.slice(0, 2).join(', ') + (routeNames.length > 2 ? ` +${routeNames.length - 2} more` : '');
+    hintEl.innerHTML = `<div class="status-msg info" style="margin-top:6px; cursor:pointer;">
+      🔁 "<strong>${match.location.name}</strong>" (${match.distanceM}m away) is already used on: ${shown}.
+      <u>Tap to reuse it here</u> so a bus-change connects properly at this stop.
+    </div>`;
+    hintEl.firstElementChild.onclick = () => {
+      applyFn(match.location);
+      hintEl.innerHTML = `<div class="status-msg success">Reusing existing stop "${match.location.name}" ✓ — this stop will now correctly link up with ${shown}.</div>`;
+    };
+  } catch (e) { /* non-fatal — suggestion is a convenience, not required */ }
+}
+
+function addStopRow() {
+  const idx = stopRows.length;
+  stopRows.push({ location: null });
+  const container = document.getElementById('stopsContainer');
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex; gap:8px; align-items:flex-start; margin-bottom:8px;';
+  row.innerHTML = `
+    <div class="autocomplete-wrap" style="flex:1;">
+      <input id="stopInput${idx}" placeholder="Stop ${idx + 1} — start typing…" autocomplete="off" />
+      <div id="stopSuggestions${idx}" class="suggestions"></div>
+      <div id="stopTransferHint${idx}"></div>
+    </div>
+    <button type="button" class="pick-btn" style="margin-top:0;" onclick="openRouteMapPicker(${idx})">📍 Map</button>
+    <button type="button" class="danger small" style="margin-top:0;" onclick="removeStopRow(${idx}, this)">Remove</button>
+  `;
+  container.appendChild(row);
+  wireAutocompleteWithFallback(`stopInput${idx}`, `stopSuggestions${idx}`, (loc) => {
+    stopRows[idx].location = loc;
+    checkTransferSuggestion(loc, (picked) => {
+      stopRows[idx].location = picked;
+      const input = document.getElementById(`stopInput${idx}`);
+      if (input) input.value = picked.name;
+    }, `stopTransferHint${idx}`);
+  });
+}
+
+/* ---------- Map picker: pick exact coordinates for origin/stop/destination,
+   instead of relying on a geocoded place name. Creates the location via
+   /api/places/manual with the raw picked lat/lng (no Google geocoding
+   round-trip needed for the coordinates themselves). ---------- */
+let routePickerMap, routePickerMarker, routePickedLatLng = null, routePickTarget = null;
+
+function openRouteMapPicker(target) {
+  routePickTarget = target;
+  document.getElementById('routeMapModal').style.display = 'block';
+  routePickedLatLng = null;
+  document.getElementById('routePickedLabel').innerText = 'Click on the map to choose the exact point';
+  document.getElementById('routeConfirmPickBtn').disabled = true;
+
+  if (!routePickerMap) {
+    routePickerMap = new google.maps.Map(document.getElementById('routePickerMap'), {
+      center: { lat: 22.5726, lng: 88.3639 }, zoom: 9, mapTypeControl: false,
+    });
+    routePickerMap.addListener('click', (e) => {
+      routePickedLatLng = { lat: e.latLng.lat(), lng: e.latLng.lng() };
+      if (routePickerMarker) routePickerMarker.setMap(null);
+      routePickerMarker = new google.maps.Marker({ position: routePickedLatLng, map: routePickerMap });
+      document.getElementById('routePickedLabel').innerText = `${routePickedLatLng.lat.toFixed(5)}, ${routePickedLatLng.lng.toFixed(5)}`;
+      document.getElementById('routeConfirmPickBtn').disabled = false;
+    });
+  }
+  setTimeout(() => google.maps.event.trigger(routePickerMap, 'resize'), 60);
+}
+
+function closeRouteMapPicker() { document.getElementById('routeMapModal').style.display = 'none'; }
+
+async function confirmRouteMapPick() {
+  if (!routePickedLatLng) return;
+  const nameInput = prompt('Label for this point (e.g. "NH2 toll plaza")', `${routePickedLatLng.lat.toFixed(4)}, ${routePickedLatLng.lng.toFixed(4)}`);
+  const name = (nameInput || `${routePickedLatLng.lat.toFixed(4)}, ${routePickedLatLng.lng.toFixed(4)}`).trim();
+  try {
+    // Coordinates are sent exactly as picked — no geocoding round-trip needed
+    // for accuracy, just a human-readable label for display.
+    const resolved = await api('/api/places/manual', {
+      method: 'POST',
+      body: JSON.stringify({ name, lat: routePickedLatLng.lat, lng: routePickedLatLng.lng }),
+    });
+    const loc = resolved.location;
+    if (routePickTarget === 'origin') {
+      rOrigin = loc;
+      document.getElementById('rOriginInput').value = loc.name;
+      document.getElementById('rOriginPickedBadge').innerText = '📍 Exact point set';
+      checkTransferSuggestion(loc, (picked) => { rOrigin = picked; document.getElementById('rOriginInput').value = picked.name; }, 'rOriginTransferHint');
+    } else if (routePickTarget === 'destination') {
+      rDest = loc;
+      document.getElementById('rDestInput').value = loc.name;
+      document.getElementById('rDestPickedBadge').innerText = '📍 Exact point set';
+      checkTransferSuggestion(loc, (picked) => { rDest = picked; document.getElementById('rDestInput').value = picked.name; }, 'rDestTransferHint');
+    } else {
+      const idx = routePickTarget;
+      stopRows[idx].location = loc;
+      const input = document.getElementById(`stopInput${idx}`);
+      if (input) input.value = loc.name;
+      checkTransferSuggestion(loc, (picked) => {
+        stopRows[idx].location = picked;
+        if (input) input.value = picked.name;
+      }, `stopTransferHint${idx}`);
+    }
+  } catch (e) {
+    alert(e.message);
+  }
+  closeRouteMapPicker();
+}
+
+function removeStopRow(idx, btn) {
+  stopRows[idx] = null; // keep array indices stable; filtered out on submit
+  btn.closest('div[style*="flex"]').remove();
+}
+
+async function populateDefaultBusPicker() {
+  const select = document.getElementById('rDefaultBus');
+  if (!select) return;
+  try {
+    const { buses } = await api('/api/official/buses', {}, 'official');
+    select.innerHTML = '<option value="">— none, I\'ll schedule trips manually —</option>' +
+      buses.map(b => `<option value="${b.id}">${b.registration_number} — ${b.operator_name || 'operator'} (${b.total_seats} seats)</option>`).join('');
+  } catch (e) { /* ignore */ }
 }
 
 async function createRoute() {
   const msg = document.getElementById('routeMsg');
   if (!rOrigin || !rDest) { statusMsg(msg, 'Pick origin and destination from the suggestions.', 'error'); return; }
   const days = Array.from(document.querySelectorAll('#daysCheckboxes input:checked')).map(c => c.value);
+  const stops = stopRows.filter(s => s && s.location).map(s => ({ location_id: s.location.id }));
+  const defaultBusId = document.getElementById('rDefaultBus').value || null;
+
+  if (defaultBusId && days.length === 0) {
+    statusMsg(msg, 'You picked a fixed bus but no operating days -- check at least one day so trips can auto-generate.', 'error');
+    return;
+  }
 
   try {
     const data = await api('/api/official/routes', {
@@ -418,12 +660,15 @@ async function createRoute() {
       body: JSON.stringify({
         origin_location_id: rOrigin.id,
         destination_location_id: rDest.id,
+        stops,
         distance_km: document.getElementById('rDistance').value ? Number(document.getElementById('rDistance').value) : null,
         base_duration_min: document.getElementById('rDuration').value ? Number(document.getElementById('rDuration').value) : null,
         schedule: days.length > 0 ? [{ days_of_week: days.join(','), departure_time: document.getElementById('rDeparture').value }] : [],
+        default_bus_id: defaultBusId,
+        default_price: defaultBusId ? Number(document.getElementById('rDefaultPrice').value) : null,
       }),
     }, 'official');
-    statusMsg(msg, `Route created — ID: ${data.routeId}. It now appears in "My region" → Routes, and in the trip-scheduling dropdown.`, 'success');
+    statusMsg(msg, `Route created -- ID: ${data.routeId}. ${data.message}`, 'success');
     loadOverview();
   } catch (e) { statusMsg(msg, e.message, 'error'); }
 }

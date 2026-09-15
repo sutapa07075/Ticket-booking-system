@@ -8,6 +8,24 @@
 <style>
   .layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; }
   @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+
+  /* Map picker modal */
+  #mapModal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; }
+  #mapModal .modal-box { background:#fff; margin:5vh auto; width:90%; max-width:820px; height:80vh;
+    border-radius:8px; overflow:hidden; display:flex; flex-direction:column; }
+  #mapModal .modal-head, #mapModal .modal-foot {
+    padding:10px 14px; display:flex; justify-content:space-between; align-items:center; }
+  #mapModal .modal-head { border-bottom:1px solid #eee; }
+  #mapModal .modal-foot { border-top:1px solid #eee; }
+  #mapModal .modal-head button { border:0; background:transparent; font-size:20px; cursor:pointer; }
+  #pickerMap { flex:1; background:#eee; }
+  .pick-btn {
+    border: 1px solid var(--border, #ddd); background: #fff; border-radius: 6px;
+    padding: 6px 10px; font-size: 0.85rem; cursor: pointer; margin-top: 4px;
+  }
+  .pick-btn:hover { background: #f4f6fa; }
+  .picked-badge { font-size:0.75rem; color:#0b5fff; margin-top:4px; display:block; }
+  .route-ctx { font-size:0.85rem; color:var(--muted); margin-bottom:8px; }
 </style>
 </head>
 <body>
@@ -24,11 +42,15 @@
           <label>From</label>
           <input id="originInput" placeholder="Start typing a city or place…" autocomplete="off" />
           <div id="originSuggestions" class="suggestions"></div>
+          <button class="pick-btn" onclick="openMapPicker('origin')">📍 Pick on map</button>
+          <span class="picked-badge" id="originPickedBadge"></span>
         </div>
         <div class="autocomplete-wrap">
           <label>To</label>
           <input id="destInput" placeholder="Start typing a city or place…" autocomplete="off" />
           <div id="destSuggestions" class="suggestions"></div>
+          <button class="pick-btn" onclick="openMapPicker('destination')">📍 Pick on map</button>
+          <span class="picked-badge" id="destPickedBadge"></span>
         </div>
         <label>Travel date</label>
         <input id="dateInput" type="date" />
@@ -45,6 +67,21 @@
   </div>
 </div>
 
+<!-- ============ Map Picker Modal ============ -->
+<div id="mapModal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <strong id="mapModalTitle">Pick a point</strong>
+      <button onclick="closeMapPicker()" aria-label="Close">×</button>
+    </div>
+    <div id="pickerMap"></div>
+    <div class="modal-foot">
+      <span id="pickedLabel" style="font-size:0.9rem; color:#666;">Click on the map to choose a point</span>
+      <button id="confirmPickBtn" onclick="confirmMapPick()" disabled>Use this point</button>
+    </div>
+  </div>
+</div>
+
 <script src="/js/common.js"></script>
 <script src="/js/config.js"></script>
 <script>
@@ -53,6 +90,12 @@ renderNav('search');
 
 let origin = null, dest = null;
 let map, routePolyline, originMarker, destMarker;
+
+// Endpoint state: exactly one of { locationId } OR { lat, lng, name } is set.
+// When the user picks from autocomplete, it's { id, lat, lng, name }.
+// When the user picks from the map, it's { lat, lng, name } with no id.
+let originPick = null; // { locationId?, lat, lng, name }
+let destPick = null;
 
 function initMap() {
   try {
@@ -73,41 +116,145 @@ function showMapUnavailable(text) {
   mapEl.innerHTML = `<div style="height:100%; display:flex; align-items:center; justify-content:center; text-align:center; padding:20px; color:var(--muted); font-size:0.9rem;">${text}</div>`;
 }
 
-// If the Maps JS script itself fails to load at all (bad key, API not
-// enabled, network blocked), this fires and the page still works —
-// search results render normally, just no map preview.
 window.gm_authFailure = function () {
   showMapUnavailable('Google Maps could not authenticate (check your API key / billing) — search still works below.');
 };
 
-wireAutocompleteWithFallback('originInput', 'originSuggestions', (loc) => origin = loc);
-wireAutocompleteWithFallback('destInput', 'destSuggestions', (loc) => dest = loc);
+// ---------------------------------------------------------------------------
+// Autocomplete
+// ---------------------------------------------------------------------------
+wireAutocompleteWithFallback('originInput', 'originSuggestions', (loc) => {
+  originPick = { locationId: loc.id, lat: loc.lat, lng: loc.lng, name: loc.name };
+  document.getElementById('originPickedBadge').innerText = '';
+});
+wireAutocompleteWithFallback('destInput', 'destSuggestions', (loc) => {
+  destPick = { locationId: loc.id, lat: loc.lat, lng: loc.lng, name: loc.name };
+  document.getElementById('destPickedBadge').innerText = '';
+});
+
+// Clear the pick if the user edits the text after choosing something
+['originInput', 'destInput'].forEach((id) => {
+  document.getElementById(id).addEventListener('input', () => {
+    if (id === 'originInput') { originPick = null; document.getElementById('originPickedBadge').innerText = ''; }
+    else { destPick = null; document.getElementById('destPickedBadge').innerText = ''; }
+  });
+});
 
 document.getElementById('dateInput').valueAsDate = new Date();
 
+// ---------------------------------------------------------------------------
+// Map picker
+// ---------------------------------------------------------------------------
+let pickerMap, pickerMarker, pickedLatLng = null, currentPickTarget = null;
+
+function openMapPicker(target) {
+  currentPickTarget = target;
+  document.getElementById('mapModal').style.display = 'block';
+  document.getElementById('mapModalTitle').innerText =
+    target === 'origin' ? 'Pick origin point' : 'Pick destination point';
+
+  // Preserve last-chosen point on this picker for convenience
+  pickedLatLng = null;
+  document.getElementById('pickedLabel').innerText = 'Click on the map to choose a point';
+  document.getElementById('confirmPickBtn').disabled = true;
+
+  if (!pickerMap) {
+    pickerMap = new google.maps.Map(document.getElementById('pickerMap'), {
+      center: { lat: 22.5726, lng: 88.3639 },
+      zoom: 10,
+      mapTypeControl: false,
+    });
+
+    pickerMap.addListener('click', (e) => {
+      pickedLatLng = { lat: e.latLng.lat(), lng: e.latLng.lng() };
+      if (pickerMarker) pickerMarker.setMap(null);
+      pickerMarker = new google.maps.Marker({ position: pickedLatLng, map: pickerMap });
+
+      const geocoder = new google.maps.Geocoder();
+      geocoder.geocode({ location: pickedLatLng }, (results, status) => {
+        const label = (status === 'OK' && results[0])
+          ? results[0].formatted_address
+          : `${pickedLatLng.lat.toFixed(4)}, ${pickedLatLng.lng.toFixed(4)}`;
+        pickedLatLng.name = label;
+        document.getElementById('pickedLabel').innerText = label;
+      });
+      document.getElementById('confirmPickBtn').disabled = false;
+    });
+  }
+
+  // Force a re-layout so tiles render correctly inside the (previously hidden) modal
+  setTimeout(() => google.maps.event.trigger(pickerMap, 'resize'), 60);
+}
+
+function closeMapPicker() {
+  document.getElementById('mapModal').style.display = 'none';
+}
+
+function confirmMapPick() {
+  if (!pickedLatLng) return;
+  const elId = currentPickTarget === 'origin' ? 'originInput' : 'destInput';
+  const badgeId = currentPickTarget === 'origin' ? 'originPickedBadge' : 'destPickedBadge';
+  const el = document.getElementById(elId);
+
+  el.value = pickedLatLng.name || `${pickedLatLng.lat.toFixed(4)}, ${pickedLatLng.lng.toFixed(4)}`;
+  document.getElementById(badgeId).innerText = '📍 Custom point (from map)';
+
+  const pick = { lat: pickedLatLng.lat, lng: pickedLatLng.lng, name: pickedLatLng.name || el.value };
+  if (currentPickTarget === 'origin') originPick = pick;
+  else destPick = pick;
+
+  closeMapPicker();
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
 async function searchRoutes() {
   const msg = document.getElementById('searchMsg');
-  if (!origin || !dest) { statusMsg(msg, 'Pick both a start and end location from the suggestions.', 'error'); return; }
+  if (!originPick || !destPick) {
+    statusMsg(msg, 'Pick both a start and end location (type or pick on map).', 'error');
+    return;
+  }
 
   const date = document.getElementById('dateInput').value;
   msg.innerHTML = '';
 
+  // Build the query string. If the user picked a real location via autocomplete,
+  // send its id; if they picked a map point, send lat/lng + name.
+  const params = new URLSearchParams({ date });
+
+  if (originPick.locationId) params.set('origin', originPick.locationId);
+  else {
+    params.set('originLat', originPick.lat);
+    params.set('originLng', originPick.lng);
+    if (originPick.name) params.set('originName', originPick.name);
+  }
+
+  if (destPick.locationId) params.set('destination', destPick.locationId);
+  else {
+    params.set('destLat', destPick.lat);
+    params.set('destLng', destPick.lng);
+    if (destPick.name) params.set('destName', destPick.name);
+  }
+
   try {
-    const data = await api(`/api/journey/search?origin=${origin.id}&destination=${dest.id}&date=${date}`);
+    const data = await api(`/api/journey/search?${params.toString()}`);
     renderResults(data);
-    if (map) drawDirections({ lat: origin.lat, lng: origin.lng }, { lat: dest.lat, lng: dest.lng });
+
+    // Draw straight-line pickup->drop polyline preview if we have both coords
+    if (map && originPick.lat != null && destPick.lat != null) {
+      drawDirections({ lat: originPick.lat, lng: originPick.lng },
+                     { lat: destPick.lat, lng: destPick.lng });
+    }
   } catch (e) {
     statusMsg(msg, e.message, 'error');
   }
 }
 
 function drawDirections(originLatLng, destLatLng) {
-  if (!map) return; // map failed to load — skip silently, results list still shown
-  if (originLatLng.lat == null || originLatLng.lng == null || destLatLng.lat == null || destLatLng.lng == null) {
-    return; // manually-entered locations have no coordinates — can't draw a route for them
-  }
+  if (!map) return;
+  if (originLatLng.lat == null || originLatLng.lng == null || destLatLng.lat == null || destLatLng.lng == null) return;
 
-  // Clear any previous route/markers before drawing the new one
   if (routePolyline) routePolyline.setMap(null);
   if (originMarker) originMarker.setMap(null);
   if (destMarker) destMarker.setMap(null);
@@ -117,10 +264,8 @@ function drawDirections(originLatLng, destLatLng) {
       if (!route.encoded_polyline) return;
       const path = decodePolyline(route.encoded_polyline);
       routePolyline = new google.maps.Polyline({ map, path, strokeColor: '#0b5fff', strokeOpacity: 0.85, strokeWeight: 4 });
-
       originMarker = new google.maps.Marker({ map, position: originLatLng, label: 'A' });
       destMarker = new google.maps.Marker({ map, position: destLatLng, label: 'B' });
-
       const bounds = new google.maps.LatLngBounds();
       path.forEach((p) => bounds.extend(p));
       map.fitBounds(bounds);
@@ -128,8 +273,6 @@ function drawDirections(originLatLng, destLatLng) {
     .catch((e) => console.warn('Route preview unavailable:', e.message));
 }
 
-// Decodes a Google encoded polyline string into an array of {lat, lng}
-// points — standard algorithm, no Google library dependency needed.
 function decodePolyline(encoded) {
   let points = [], index = 0, lat = 0, lng = 0;
   while (index < encoded.length) {
@@ -154,10 +297,16 @@ function renderResults(data) {
   if (hasDirect) {
     box.innerHTML += `<h3>Direct routes</h3>`;
     data.direct.forEach(d => {
+      const routeCtx = `<div class="route-ctx">
+        ${d.isSubSegment
+          ? `Bus runs <strong>${d.route.origin_name} → ${d.route.destination_name}</strong> — you board at <strong>${d.boardAt.name}</strong> and alight at <strong>${d.alightAt.name}</strong>`
+          : `<strong>${d.boardAt.name} → ${d.alightAt.name}</strong>`}
+      </div>`;
       if (d.trips.length === 0) {
-        box.innerHTML += `<div class="card"><small>A direct route exists but no bus is scheduled on this date.</small></div>`;
+        box.innerHTML += `<div class="card">${routeCtx}<small>A route covers this journey but no bus is scheduled on this date.</small></div>`;
+      } else {
+        box.innerHTML += `<div class="card" style="padding-bottom:4px;">${routeCtx}${d.trips.map(t => tripCard(t, d)).join('')}</div>`;
       }
-      d.trips.forEach(t => box.innerHTML += tripCard(t));
     });
   }
 
@@ -165,12 +314,13 @@ function renderResults(data) {
     box.innerHTML += `<h3>Connecting routes <span class="badge amber">bus change required</span></h3>`;
     data.connecting.forEach(c => {
       box.innerHTML += `<div class="card">
-        <strong>Change buses en route</strong>
+        <strong>Change buses en route (${c.transfers} transfer${c.transfers === 1 ? '' : 's'})</strong>
         ${c.legs.map((leg, i) => `
           <div style="margin-top:10px;">
             <div class="badge">Leg ${i + 1}</div>
+            <div class="route-ctx">${leg.boardAt.name} → ${leg.alightAt.name} <small style="color:var(--muted);">(on route ${leg.route.origin_name} → ${leg.route.destination_name})</small></div>
             ${leg.trips.length > 0
-              ? leg.trips.map(t => tripCard(t)).join('')
+              ? leg.trips.map(t => tripCard(t, leg)).join('')
               : `<div><small>No bus scheduled on this leg for the chosen date.</small></div>`}
           </div>`).join('')}
       </div>`;
@@ -182,8 +332,26 @@ function renderResults(data) {
   }
 }
 
-function tripCard(trip) {
-  return `<div class="trip-card" onclick="location.href='/booking.html?tripId=${trip.id}'">
+// Pass along the leg's boardAt/alightAt so the booking page can pre-fill
+// the on-route pickup/dropping the user selected.
+function tripCard(trip, leg) {
+  const legParams = new URLSearchParams();
+  if (leg && leg.boardAt) {
+    if (leg.boardAt.location_id) legParams.set('boardStopId', leg.boardAt.location_id);
+    if (leg.boardAt.lat != null) legParams.set('boardLat', leg.boardAt.lat);
+    if (leg.boardAt.lng != null) legParams.set('boardLng', leg.boardAt.lng);
+    if (leg.boardAt.name) legParams.set('boardName', leg.boardAt.name);
+  }
+  if (leg && leg.alightAt) {
+    if (leg.alightAt.location_id) legParams.set('dropStopId', leg.alightAt.location_id);
+    if (leg.alightAt.lat != null) legParams.set('dropLat', leg.alightAt.lat);
+    if (leg.alightAt.lng != null) legParams.set('dropLng', leg.alightAt.lng);
+    if (leg.alightAt.name) legParams.set('dropName', leg.alightAt.name);
+  }
+  const qs = legParams.toString();
+  const href = `/booking.html?tripId=${trip.id}${qs ? '&' + qs : ''}`;
+
+  return `<div class="trip-card" onclick="location.href='${href}'">
     <div>
       <strong>${trip.operator_name || 'Bus operator'}</strong> · ${trip.registration_number}<br>
       <span class="badge">${trip.bus_type}</span>
@@ -198,7 +366,6 @@ function tripCard(trip) {
 }
 </script>
 <script>
-  // Load the Maps script dynamically so it always uses the current key from config.js.
   const gmapScript = document.createElement('script');
   gmapScript.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_BROWSER_KEY}&callback=initMap&loading=async`;
   gmapScript.async = true;

@@ -137,3 +137,10 @@ button.small { width: auto; padding: 6px 12px; font-size: 0.85rem; margin-top: 0
 .stop-list li { padding: 8px 0; border-bottom: 1px dashed var(--border); font-size: 0.9rem; }
 
 .footer-note { color: var(--muted); font-size: 0.8rem; margin-top: 30px; text-align: center; }
+
+.pick-btn {
+  border: 1px solid var(--border); background: #fff; border-radius: 6px;
+  padding: 6px 10px; font-size: 0.85rem; cursor: pointer; margin-top: 4px; width: auto; color: var(--text); font-weight: 500;
+}
+.pick-btn:hover { background: #f4f6fa; }
+.picked-badge { font-size: 0.75rem; color: var(--primary); margin-top: 4px; display: block; }

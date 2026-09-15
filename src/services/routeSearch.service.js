@@ -1,100 +1,298 @@
+// src/services/routeSearch.service.js
 const db = require('../db/init');
+const polylineSvc = require('./polyline.service');
 
-/**
- * Finds ways to travel from originLocationId to destLocationId on a given date.
- * 1) Direct: a single active route whose origin/destination (or any two stops
- *    in order) match.
- * 2) Connecting (1 transfer): route A ends/stops at some hub location X,
- *    and route B starts/stops at X and reaches the destination -> suggest
- *    "board bus A, get down at X, change to bus B".
- *
- * This is a simple graph search suitable for a moderate number of routes;
- * for a large network you'd precompute a route graph / use a real routing engine.
- */
+// Direct match: endpoint must be an official stop OR within this distance of
+// the polyline. Anything further out is not a real direct ride — you'd be
+// dropped kilometres away from where you asked to go.
+const DIRECT_SNAP_OFFSET_M = 500;
+
+// Connecting match: an on-route pickup (map-picked point, unofficial stop)
+// may be slightly off the road. This is the tolerance for treat-as-a-hub.
+const CONNECTING_SNAP_OFFSET_M = 3000;
+
+const MIN_TRANSFER_GAP_MIN = 20;
+const MAX_TRANSFERS = 3;
+const MAX_STATES = 5000;
+const TRANSFER_HUB_TOLERANCE_M = 800;
+
+function resolveEndpoint(input) {
+  if (input.locationId) {
+    const loc = db.prepare(`SELECT * FROM locations WHERE id = ?`).get(input.locationId);
+    if (!loc) throw new Error(`Location not found: ${input.locationId}`);
+    return { lat: loc.lat, lng: loc.lng, locationId: loc.id, name: loc.name };
+  }
+  if (typeof input.lat === 'number' && typeof input.lng === 'number') {
+    return { lat: input.lat, lng: input.lng, locationId: null, name: input.name || 'Picked point' };
+  }
+  throw new Error('Endpoint must have locationId or {lat,lng}');
+}
 
 function getRouteStopsInOrder(routeId) {
   const route = db.prepare(`SELECT * FROM routes WHERE id = ?`).get(routeId);
-  const stops = db
-    .prepare(`SELECT * FROM route_stops WHERE route_id = ? ORDER BY stop_order`)
-    .all(routeId);
-  // Build full ordered list: origin -> stops... -> destination
+  const stops = db.prepare(`SELECT * FROM route_stops WHERE route_id = ? ORDER BY stop_order`).all(routeId);
   return [
-    { location_id: route.origin_location_id, eta_offset_min: 0 },
-    ...stops,
-    { location_id: route.destination_location_id, eta_offset_min: route.base_duration_min },
+    { location_id: route.origin_location_id, eta_offset_min: 0, kind: 'origin' },
+    ...stops.map((s) => ({ ...s, kind: 'stop' })),
+    { location_id: route.destination_location_id, eta_offset_min: route.base_duration_min, kind: 'destination' },
   ];
 }
 
 function activeRoutes() {
-  return db.prepare(`SELECT * FROM routes WHERE is_cancelled = 0`).all();
+  return db.prepare(`SELECT * FROM routes WHERE is_cancelled = 0 AND polyline IS NOT NULL`).all();
 }
 
-function findDirectRoutes(originId, destId) {
-  const routes = activeRoutes();
-  const matches = [];
+/**
+ * Locate an endpoint on a route, in two stages:
+ *   1. If it's an official stop on this route, use its real coords.
+ *   2. Otherwise snap to the polyline — but require a tight offset for
+ *      "direct" use, and allow a looser offset for "connecting" use.
+ *
+ * Returns { fraction, snapped, etaOffsetMin, offsetM, isOfficialStop } or null.
+ */
+function locateOnRoute(route, endpoint, { maxOffsetM = DIRECT_SNAP_OFFSET_M } = {}) {
+  if (!route.polyline) return null;
+  const polyline = polylineSvc.decodePolyline(route.polyline);
+  if (polyline.length < 2) return null;
 
-  for (const route of routes) {
-    const ordered = getRouteStopsInOrder(route.id);
-    const originIdx = ordered.findIndex((s) => s.location_id === originId);
-    const destIdx = ordered.findIndex((s) => s.location_id === destId);
-    if (originIdx !== -1 && destIdx !== -1 && originIdx < destIdx) {
-      matches.push({
-        type: 'direct',
-        route,
-        boardAt: ordered[originIdx],
-        alightAt: ordered[destIdx],
-      });
+  // Stage 1: match against official stops (if endpoint has a location_id)
+  if (endpoint.locationId) {
+    const stops = getRouteStopsInOrder(route.id);
+    for (const s of stops) {
+      if (s.location_id !== endpoint.locationId) continue;
+      const loc = db.prepare(`SELECT * FROM locations WHERE id = ?`).get(s.location_id);
+      if (!loc || loc.lat == null || loc.lng == null) continue;
+      const snap = polylineSvc.snapToPolyline(polyline, { lat: loc.lat, lng: loc.lng });
+      const fraction = snap
+        ? polylineSvc.fractionAlong(polyline, snap.alongM)
+        : (s.eta_offset_min || 0) / (route.base_duration_min || 240);
+      return {
+        fraction,
+        snapped: { lat: loc.lat, lng: loc.lng },
+        etaOffsetMin: s.eta_offset_min != null
+          ? s.eta_offset_min
+          : Math.round((route.base_duration_min || 240) * fraction),
+        offsetM: snap ? snap.offsetM : 0,
+        isOfficialStop: true,
+      };
     }
   }
-  return matches;
+
+  // Stage 2: geometric snap
+  const snap = polylineSvc.snapToPolyline(polyline, { lat: endpoint.lat, lng: endpoint.lng });
+  if (!snap || snap.offsetM > maxOffsetM) return null;
+  const fraction = polylineSvc.fractionAlong(polyline, snap.alongM);
+  return {
+    fraction,
+    snapped: snap.snapped,
+    etaOffsetMin: Math.round((route.base_duration_min || 240) * fraction),
+    offsetM: snap.offsetM,
+    isOfficialStop: false,
+  };
 }
 
-function findConnectingRoutes(originId, destId, maxTransfers = 1) {
+/**
+ * Return every hub on a route (its stops + origin + destination), each with
+ * a fraction [0..1] along the polyline.
+ */
+function hubsOnRoute(route) {
+  const stops = getRouteStopsInOrder(route.id);
+  const polyline = polylineSvc.decodePolyline(route.polyline || '');
+  return stops.map((s) => {
+    const loc = db.prepare(`SELECT * FROM locations WHERE id = ?`).get(s.location_id);
+    if (!loc) return null;
+    const snap = polyline.length >= 2
+      ? polylineSvc.snapToPolyline(polyline, { lat: loc.lat, lng: loc.lng })
+      : null;
+    return {
+      location_id: s.location_id,
+      name: loc.name,
+      lat: loc.lat,
+      lng: loc.lng,
+      fraction: snap ? polylineSvc.fractionAlong(polyline, snap.alongM) : 0,
+      etaOffsetMin: s.eta_offset_min || 0,
+    };
+  }).filter(Boolean).sort((a, b) => a.fraction - b.fraction);
+}
+
+function routeNames(route) {
+  const o = db.prepare(`SELECT name FROM locations WHERE id = ?`).get(route.origin_location_id);
+  const d = db.prepare(`SELECT name FROM locations WHERE id = ?`).get(route.destination_location_id);
+  return { origin_name: o ? o.name : null, destination_name: d ? d.name : null };
+}
+
+function search(originInput, destInput) {
+  const origin = resolveEndpoint(originInput);
+  const dest = resolveEndpoint(destInput);
+
   const routes = activeRoutes();
-  const results = [];
 
-  // routes that can be boarded from originId
-  const legOneCandidates = routes
-    .map((r) => ({ route: r, ordered: getRouteStopsInOrder(r.id) }))
-    .filter((r) => r.ordered.some((s) => s.location_id === originId));
+  // ---------- DIRECT ----------
+  // Only routes where BOTH endpoints are within the tight direct tolerance
+  // (or are official stops). This is what stops "Sealdah is 3km from the
+  // Durgapur→Kolkata polyline" from being shown as a direct ride.
+  const directMatches = [];
+  for (const route of routes) {
+    const o = locateOnRoute(route, origin, { maxOffsetM: DIRECT_SNAP_OFFSET_M });
+    const d = locateOnRoute(route, dest, { maxOffsetM: DIRECT_SNAP_OFFSET_M });
+    if (!o || !d) continue;
+    if (o.fraction >= d.fraction) continue;
+    directMatches.push({ route, o, d });
+  }
 
-  for (const leg1 of legOneCandidates) {
-    const boardIdx = leg1.ordered.findIndex((s) => s.location_id === originId);
-    // every stop after boarding on leg1 is a possible transfer hub
-    for (let i = boardIdx + 1; i < leg1.ordered.length; i++) {
-      const hub = leg1.ordered[i].location_id;
-      if (hub === destId) continue; // that would've been a direct route already
+  const direct = directMatches.map(({ route, o, d }) => {
+    const names = routeNames(route);
+    const isSubSegment = o.fraction > 0.05 || d.fraction < 0.95;
+    return {
+      type: 'direct',
+      route: { ...route, ...names },
+      isSubSegment,
+      boardAt: {
+        location_id: origin.locationId,
+        lat: o.snapped.lat, lng: o.snapped.lng,
+        fraction: o.fraction, eta_offset_min: o.etaOffsetMin,
+        name: origin.name,
+        isOfficialStop: o.isOfficialStop,
+      },
+      alightAt: {
+        location_id: dest.locationId,
+        lat: d.snapped.lat, lng: d.snapped.lng,
+        fraction: d.fraction, eta_offset_min: d.etaOffsetMin,
+        name: dest.name,
+        isOfficialStop: d.isOfficialStop,
+      },
+    };
+  });
 
-      const legTwoCandidates = routes
-        .filter((r) => r.id !== leg1.route.id)
-        .map((r) => ({ route: r, ordered: getRouteStopsInOrder(r.id) }))
-        .filter((r) => r.ordered.some((s) => s.location_id === hub));
+  // ---------- CONNECTING ----------
+  // Uses the looser tolerance so map-picked points a bit off-road still count.
+  // Now collects all multi-leg paths and only returns those requiring >=1
+  // transfer, so a "connecting" result always genuinely involves a change.
+  const connecting = findConnecting({ origin, dest, routes });
 
-      for (const leg2 of legTwoCandidates) {
-        const hubIdxLeg2 = leg2.ordered.findIndex((s) => s.location_id === hub);
-        const destIdxLeg2 = leg2.ordered.findIndex((s) => s.location_id === destId);
-        if (destIdxLeg2 !== -1 && hubIdxLeg2 < destIdxLeg2) {
-          results.push({
-            type: 'connecting',
-            transfers: 1,
-            legs: [
-              { route: leg1.route, boardAt: leg1.ordered[boardIdx], alightAt: leg1.ordered[i] },
-              { route: leg2.route, boardAt: leg2.ordered[hubIdxLeg2], alightAt: leg2.ordered[destIdxLeg2] },
-            ],
-            changeAtLocationId: hub,
+  return { direct, connecting };
+}
+
+function findConnecting({ origin, dest, routes, maxResults = 5 }) {
+  const routeData = routes.map((route) => {
+    const hubs = hubsOnRoute(route);
+    // For connecting, we want a looser snap tolerance
+    const o = locateOnRoute(route, origin, { maxOffsetM: CONNECTING_SNAP_OFFSET_M });
+    const d = locateOnRoute(route, dest,   { maxOffsetM: CONNECTING_SNAP_OFFSET_M });
+
+    if (o && !hubs.some((h) => Math.abs(h.fraction - o.fraction) < 0.001)) {
+      hubs.push({
+        location_id: null, name: origin.name, lat: o.snapped.lat, lng: o.snapped.lng,
+        fraction: o.fraction, etaOffsetMin: o.etaOffsetMin, synthetic: true,
+      });
+    }
+    if (d && !hubs.some((h) => Math.abs(h.fraction - d.fraction) < 0.001)) {
+      hubs.push({
+        location_id: null, name: dest.name, lat: d.snapped.lat, lng: d.snapped.lng,
+        fraction: d.fraction, etaOffsetMin: d.etaOffsetMin, synthetic: true,
+      });
+    }
+    hubs.sort((a, b) => a.fraction - b.fraction);
+    return { route, hubs, o, d };
+  });
+
+  function samePhysical(a, b) {
+    if (a.location_id && b.location_id && a.location_id === b.location_id) return true;
+    if (a.lat == null || a.lng == null || b.lat == null || b.lng == null) return false;
+    const d = polylineSvc.haversineM({ lat: a.lat, lng: a.lng }, { lat: b.lat, lng: b.lng });
+    return d < TRANSFER_HUB_TOLERANCE_M;
+  }
+
+  const seeds = [];
+  for (const rd of routeData) {
+    if (!rd.o) continue;
+    const hub = rd.hubs.find((h) => Math.abs(h.fraction - rd.o.fraction) < 0.001);
+    if (hub) seeds.push({ route: rd.route, hub, cost: 0, legs: [{ route: rd.route, boardAt: hub }] });
+  }
+
+  const visited = new Set();
+  const queue = seeds.slice();
+  const foundPaths = [];
+
+  while (queue.length) {
+    queue.sort((a, b) => a.cost - b.cost);
+    const cur = queue.shift();
+    const key = `${cur.route.id}|${cur.hub.fraction.toFixed(6)}`;
+    if (visited.has(key)) continue;
+    visited.add(key);
+
+    // Record a completed path (but don't return — keep exploring alternatives)
+    const rd = routeData.find((r) => r.route.id === cur.route.id);
+    if (rd && rd.d && cur.hub.fraction < rd.d.fraction) {
+      const completedLegs = cur.legs.map((leg) => ({ ...leg }));
+      const lastLeg = completedLegs[completedLegs.length - 1];
+      lastLeg.alightAt = {
+        location_id: dest.locationId,
+        lat: rd.d.snapped.lat, lng: rd.d.snapped.lng,
+        fraction: rd.d.fraction, eta_offset_min: rd.d.etaOffsetMin,
+        name: dest.name,
+      };
+      for (let i = 0; i < completedLegs.length - 1; i++) {
+        completedLegs[i].alightAt = completedLegs[i + 1].boardAt;
+      }
+      const namedLegs = completedLegs.map((leg) => ({
+        ...leg,
+        route: { ...leg.route, ...routeNames(leg.route) },
+      }));
+      const sig = namedLegs.map((l) => l.route.id).join('|');
+      if (!foundPaths.some((p) => p._sig === sig)) {
+        foundPaths.push({
+          _sig: sig,
+          type: 'connecting',
+          transfers: namedLegs.length - 1,
+          legs: namedLegs,
+          totalDurationMin:
+            namedLegs.reduce((s, l) => s + (l.route.base_duration_min || 240), 0) +
+            (namedLegs.length - 1) * MIN_TRANSFER_GAP_MIN,
+        });
+      }
+    }
+
+    for (const next of routeData) {
+      if (next.route.id === cur.route.id) {
+        for (const h of next.hubs) {
+          if (h.fraction <= cur.hub.fraction) continue;
+          const nk = `${next.route.id}|${h.fraction.toFixed(6)}`;
+          if (visited.has(nk)) continue;
+          const travelMin = Math.round(
+            (next.route.base_duration_min || 240) * (h.fraction - cur.hub.fraction)
+          );
+          queue.push({
+            route: next.route, hub: h,
+            cost: cur.cost + travelMin,
+            legs: cur.legs,
+          });
+        }
+      } else {
+        for (const h of next.hubs) {
+          if (!samePhysical(cur.hub, h)) continue;
+          const nk = `${next.route.id}|${h.fraction.toFixed(6)}`;
+          if (visited.has(nk)) continue;
+          if (cur.legs.length >= MAX_TRANSFERS + 1) continue;
+          queue.push({
+            route: next.route, hub: h,
+            cost: cur.cost + MIN_TRANSFER_GAP_MIN,
+            legs: [...cur.legs, { route: next.route, boardAt: h }],
           });
         }
       }
     }
+
+    if (visited.size > MAX_STATES) break;
   }
 
-  return results;
+  // Only paths requiring a real change of bus belong here.
+  const multiLeg = foundPaths.filter((p) => p.transfers >= 1);
+  multiLeg.sort((a, b) => {
+    if (a.transfers !== b.transfers) return a.transfers - b.transfers;
+    return a.totalDurationMin - b.totalDurationMin;
+  });
+  return multiLeg.slice(0, maxResults).map(({ _sig, totalDurationMin, ...p }) => p);
 }
 
-function search(originId, destId) {
-  const direct = findDirectRoutes(originId, destId);
-  const connecting = direct.length > 0 ? [] : findConnectingRoutes(originId, destId);
-  return { direct, connecting };
-}
-
-module.exports = { search, getRouteStopsInOrder };
+module.exports = { search, getRouteStopsInOrder, resolveEndpoint, locateOnRoute };

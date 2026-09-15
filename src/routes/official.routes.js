@@ -8,6 +8,9 @@ const apiSetu = require('../services/apiSetu.service');
 const storage = require('../services/storage.service');
 const otpService = require('../services/otp.service');
 
+const busAvailability = require('../services/busAvailability.service');
+const maps = require('../services/googleMaps.service');
+const polylineSvc = require('../services/polyline.service');
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
@@ -35,6 +38,23 @@ function safe(handler) {
     }
   };
 }
+
+/* ---------- Fuel price index (used by dynamic pricing's fuel factor) ---------- */
+router.post('/fuel-price', requireSuperAdmin, safe(async (req, res) => {
+  const { price_per_liter } = req.body;
+  if (typeof price_per_liter !== 'number' || price_per_liter <= 0) {
+    return res.status(400).json({ error: 'price_per_liter must be a positive number' });
+  }
+  db.prepare(
+    `INSERT INTO fuel_price_index (id, price_per_liter, source, updated_by_official_id) VALUES (?, ?, 'manual', ?)`
+  ).run(uuidv4(), price_per_liter, req.official.id);
+  res.status(201).json({ message: `Fuel price updated to ₹${price_per_liter}/L — will apply on the next pricing recalculation (every 30 min, or immediately for newly created trips).` });
+}));
+
+router.get('/fuel-price', requireOfficial, safe(async (req, res) => {
+  const latest = db.prepare(`SELECT * FROM fuel_price_index ORDER BY created_at DESC LIMIT 1`).get();
+  res.json({ latest: latest || null });
+}));
 
 /* ---------- Bootstrap: create the first super admin + region ---------- */
 router.post('/bootstrap', safe(async (req, res) => {
@@ -193,16 +213,37 @@ router.post('/buses', requireOfficial, safe(async (req, res) => {
 /* ---------- Route creation, schedule, and cancellation (region-scoped) ---------- */
 
 router.post('/routes', requireOfficial, safe(async (req, res) => {
-  const { origin_location_id, destination_location_id, distance_km, base_duration_min, stops, schedule, route_code } = req.body;
+  const { origin_location_id, destination_location_id, distance_km, base_duration_min, stops, schedule, route_code, default_bus_id, default_price } = req.body;
   if (!origin_location_id || !destination_location_id) {
     return res.status(400).json({ error: 'origin_location_id and destination_location_id required' });
   }
 
+  // If a fixed/default bus is given for a recurring schedule, it must be
+  // one of this official's own region's buses.
+  if (default_bus_id) {
+    const bus = db.prepare(`SELECT * FROM buses WHERE id = ? AND region_id = ?`).get(default_bus_id, req.official.regionId);
+    if (!bus) return res.status(404).json({ error: 'default_bus_id not found in your region' });
+  }
+
+  const origin = db.prepare(`SELECT * FROM locations WHERE id = ?`).get(origin_location_id);
+  const dest = db.prepare(`SELECT * FROM locations WHERE id = ?`).get(destination_location_id);
+  if (!origin || !dest) return res.status(404).json({ error: 'origin_location_id or destination_location_id not found' });
+  if (origin.lat == null || origin.lng == null || dest.lat == null || dest.lng == null) {
+    return res.status(400).json({
+      error: 'Origin and destination must have real coordinates. If they were added via "type it manually" without picking a map point, edit those locations to include lat/lng, or re-add them using autocomplete / map pick.',
+    });
+  }
+
+  const stopLocations = Array.isArray(stops)
+    ? stops.map((s) => db.prepare(`SELECT * FROM locations WHERE id = ?`).get(s.location_id))
+        .filter((l) => l && l.lat != null && l.lng != null)
+    : [];
+
   const routeId = uuidv4();
   db.prepare(
-    `INSERT INTO routes (id, route_code, origin_location_id, destination_location_id, distance_km, base_duration_min, region_id, created_by_official_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(routeId, route_code || null, origin_location_id, destination_location_id, distance_km, base_duration_min, req.official.regionId, req.official.id);
+    `INSERT INTO routes (id, route_code, origin_location_id, destination_location_id, distance_km, base_duration_min, region_id, created_by_official_id, default_bus_id, default_price)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(routeId, route_code || null, origin_location_id, destination_location_id, distance_km || null, base_duration_min || null, req.official.regionId, req.official.id, default_bus_id || null, default_price || null);
 
   if (Array.isArray(stops)) {
     const insertStop = db.prepare(`INSERT INTO route_stops (id, route_id, location_id, stop_order, eta_offset_min) VALUES (?, ?, ?, ?, ?)`);
@@ -214,7 +255,51 @@ router.post('/routes', requireOfficial, safe(async (req, res) => {
     schedule.forEach((s) => insertSched.run(uuidv4(), routeId, s.days_of_week, s.departure_time));
   }
 
-  res.status(201).json({ routeId, message: 'Route created' });
+  // --- Build the road-route polyline through origin -> stops -> destination,
+  // in that exact order, so every official-selected stop guaranteed lies ON
+  // the stored polyline (search's snap-to-route logic then finds it with
+  // ~0 offset instead of possibly missing routes with a wobbly hand-drawn line).
+  let polylineNote = '';
+  try {
+    const routeResult = await maps.computeRoute(
+      { lat: origin.lat, lng: origin.lng },
+      { lat: dest.lat, lng: dest.lng },
+      stopLocations.map((l) => ({ lat: l.lat, lng: l.lng }))
+    );
+    if (routeResult && routeResult.encoded_polyline) {
+      db.prepare(
+        `UPDATE routes SET polyline = ?, polyline_length_m = ?, distance_km = COALESCE(?, distance_km), base_duration_min = COALESCE(?, base_duration_min) WHERE id = ?`
+      ).run(
+        routeResult.encoded_polyline,
+        routeResult.distance_km * 1000,
+        distance_km || routeResult.distance_km,
+        base_duration_min || routeResult.duration_min,
+        routeId
+      );
+      polylineNote = ' Road-route polyline computed via Google Routes API — search will now find pickup/drop points anywhere along the actual road.';
+    } else {
+      throw new Error('no route returned');
+    }
+  } catch (e) {
+    // Fall back to a straight-line polyline through origin -> stops -> destination
+    // so route search still works (just without real road-snapping) even if the
+    // Routes API is unavailable (no key/billing, quota, network).
+    console.warn('[official/routes] computeRoute failed, using straight-line fallback:', e.message);
+    const points = [origin, ...stopLocations, dest].map((l) => ({ lat: l.lat, lng: l.lng }));
+    const encoded = polylineSvc.encodePolyline(points);
+    const lengthM = polylineSvc.polylineLengthM(points);
+    db.prepare(
+      `UPDATE routes SET polyline = ?, polyline_length_m = ?, distance_km = COALESCE(?, distance_km) WHERE id = ?`
+    ).run(encoded, lengthM, distance_km || Math.round((lengthM / 1000) * 10) / 10, routeId);
+    polylineNote = ' Google road-routing was unavailable, so a straight-line polyline through your stops was stored instead (search still works, just without real road-snapping).';
+  }
+
+  res.status(201).json({
+    routeId,
+    message: (default_bus_id
+      ? 'Route created with a fixed bus + recurring schedule — matching trips will now appear automatically in search on the scheduled days, no need to create a trip manually for each date.'
+      : 'Route created') + polylineNote,
+  });
 }));
 
 router.post('/routes/:routeId/cancel', requireOfficial, safe(async (req, res) => {
@@ -249,6 +334,21 @@ router.post('/trips', requireOfficial, safe(async (req, res) => {
   if (!bus) return res.status(404).json({ error: `No bus found with ID "${bus_id}". Pick one from the Buses list below.` });
   if (bus.region_id !== req.official.regionId) return res.status(403).json({ error: 'Bus not in your region' });
 
+  // A single physical bus can't run two overlapping trips — check it isn't
+  // already out on a route that hasn't finished by the time this one starts.
+  const availability = busAvailability.checkBusAvailability({
+    busId: bus_id,
+    date: travel_date,
+    departureTime: departure_time,
+    durationMin: route.base_duration_min,
+  });
+  if (!availability.available) {
+    const c = availability.conflictingTrip;
+    return res.status(409).json({
+      error: `Bus ${bus.registration_number} is already scheduled on "${c.route}" departing ${c.departure_time} that day (expected to still be en route around this time). Pick a different bus or time.`,
+    });
+  }
+
   const tripId = uuidv4();
   db.prepare(
     `INSERT INTO trips (id, route_id, bus_id, driver_id, travel_date, departure_time, base_price, current_price)
@@ -256,6 +356,32 @@ router.post('/trips', requireOfficial, safe(async (req, res) => {
   ).run(tripId, route_id, bus_id, driver_id || null, travel_date, departure_time, base_price, base_price);
 
   res.status(201).json({ tripId });
+}));
+
+/* ---------- Delete a driver ----------
+   Removes the driver entirely (not just marking rejected). Blocked if the
+   driver is currently assigned to a bus that has upcoming trips, so an
+   official can't accidentally orphan an active bus's driver — unassign
+   them from the bus first (or wait for the trip to pass) if that happens. */
+router.delete('/drivers/:driverId', requireOfficial, safe(async (req, res) => {
+  const driver = db.prepare(`SELECT * FROM drivers WHERE id = ?`).get(req.params.driverId);
+  if (!driver) return res.status(404).json({ error: 'Driver not found' });
+  if (driver.region_id !== req.official.regionId) {
+    return res.status(403).json({ error: 'You can only manage drivers in your own region' });
+  }
+
+  const upcomingTrip = db
+    .prepare(
+      `SELECT t.id FROM trips t WHERE t.driver_id = ? AND t.travel_date >= date('now') AND t.status != 'cancelled' LIMIT 1`
+    )
+    .get(req.params.driverId);
+  if (upcomingTrip) {
+    return res.status(409).json({ error: 'This driver has an upcoming scheduled trip — reassign or cancel that trip before deleting the driver.' });
+  }
+
+  db.prepare(`DELETE FROM bus_drivers WHERE driver_id = ?`).run(req.params.driverId);
+  db.prepare(`DELETE FROM drivers WHERE id = ?`).run(req.params.driverId);
+  res.json({ message: 'Driver deleted' });
 }));
 
 /* ---------- Manual KYC override ----------

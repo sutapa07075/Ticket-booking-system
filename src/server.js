@@ -84,3 +84,11 @@ server.listen(PORT, () => {
   console.log(`🚌 Bus booking server running on http://localhost:${PORT}`);
   console.log(`   WebSocket tracking on ws://localhost:${PORT}/ws/track`);
 });
+
+const bookingService = require('./services/booking.service');
+
+setInterval(() => {
+  bookingService.sweepStalePendingBookings().catch(() => {});
+}, 30 * 1000);
+
+bookingService.sweepStalePendingBookings().catch(() => {});

@@ -78,14 +78,22 @@ async function placeDetails(placeId) {
  * Returns distance, duration, and an encoded polyline the frontend can
  * decode and draw directly — no legacy DirectionsService/Renderer needed.
  */
-async function computeRoute(originLatLng, destLatLng) {
+async function computeRoute(originLatLng, destLatLng, waypoints = []) {
+  const body = {
+    origin: { location: { latLng: { latitude: originLatLng.lat, longitude: originLatLng.lng } } },
+    destination: { location: { latLng: { latitude: destLatLng.lat, longitude: destLatLng.lng } } },
+    travelMode: 'DRIVE',
+  };
+  // Intermediate stops (e.g. a route's ordered stops) — Routes API drives the
+  // polyline THROUGH these in order, guaranteeing the stored polyline passes
+  // exactly through every official-selected stop.
+  if (waypoints.length > 0) {
+    body.intermediates = waypoints.map((w) => ({ location: { latLng: { latitude: w.lat, longitude: w.lng } } }));
+  }
+
   const { data } = await axios.post(
     `${ROUTES_BASE}/directions/v2:computeRoutes`,
-    {
-      origin: { location: { latLng: { latitude: originLatLng.lat, longitude: originLatLng.lng } } },
-      destination: { location: { latLng: { latitude: destLatLng.lat, longitude: destLatLng.lng } } },
-      travelMode: 'DRIVE',
-    },
+    body,
     {
       headers: {
         'X-Goog-Api-Key': KEY,

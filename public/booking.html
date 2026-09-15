@@ -114,6 +114,30 @@ function updateFare() {
   payBtn.innerText = `Pay ₹${total} and book`;
 }
 
+/**
+ * Fire-and-forget release to free seat locks when the user cancels or
+ * leaves the page. Uses keepalive so the request survives navigation.
+ */
+function releaseCurrentBooking(useBeacon) {
+  if (!currentBooking) return;
+  const payload = JSON.stringify({
+    bookingId: currentBooking.bookingId,
+    holderId: currentBooking.holderId,
+  });
+  if (useBeacon && navigator.sendBeacon) {
+    navigator.sendBeacon('/api/bookings/release', new Blob([payload], { type: 'application/json' }));
+  } else {
+    // fetch with keepalive so it completes on unload
+    fetch('/api/bookings/release', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {});
+  }
+  currentBooking = null;
+}
+
 async function startPayment() {
   const payMsg = document.getElementById('payMsg');
   const payBtn = document.getElementById('payBtn');
@@ -145,8 +169,11 @@ async function startPayment() {
         await confirmBooking(response);
       },
       modal: {
+        // User closed the Razorpay modal without paying — release locks NOW
+        // instead of waiting 5 minutes for the TTL to expire.
         ondismiss: function () {
-          statusMsg(payMsg, 'Payment cancelled — your seat hold will expire in a few minutes.', 'error');
+          releaseCurrentBooking(false);
+          statusMsg(payMsg, 'Payment cancelled — your seats have been released.', 'error');
           payBtn.disabled = false;
           payBtn.innerText = `Pay ₹${trip.current_price * selectedSeats.size} and book`;
         },
@@ -176,12 +203,23 @@ async function confirmBooking(razorpayResponse) {
         razorpay_signature: razorpayResponse.razorpay_signature,
       }),
     });
+    currentBooking = null; // confirmed — locks already released server-side
     statusMsg(payMsg, 'Booking confirmed! Redirecting to your bookings…', 'success');
     setTimeout(() => location.href = `/bookings.html`, 800);
   } catch (e) {
     statusMsg(payMsg, `Payment succeeded but booking confirmation failed: ${e.message}. Contact support with booking ID ${currentBooking.bookingId}.`, 'error');
   }
 }
+
+// Release locks if the user closes the tab / navigates away before paying.
+window.addEventListener('beforeunload', () => {
+  if (currentBooking) releaseCurrentBooking(true);
+});
+
+// Also handle the (less common) case of a browser back/forward cache restore.
+window.addEventListener('pagehide', () => {
+  if (currentBooking) releaseCurrentBooking(true);
+});
 </script>
 <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 </body>
