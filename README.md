@@ -225,7 +225,7 @@ POST /api/partner/booking/initiate     { userPhone, tripId, seatIds[] }         
 POST /api/partner/booking/confirm      { ... razorpay fields }                    [x-api-key/secret]
 ```
 
-## 5. Honest scope notes (for a student project, be upfront about these)
+## 5. Things could not be Implemented
 
 - **Weather & fuel-price factors** in pricing are stubbed at neutral (1.0) —
   wire up a real weather API (OpenWeather etc.) and a fuel-price feed to
