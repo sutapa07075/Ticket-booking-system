@@ -1,0 +1,33 @@
+{
+  "name": "bus-ticket-booking",
+  "version": "1.0.0",
+  "description": "Bus ticket booking platform - Node/Express/SQLite (student project)",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "initdb": "node src/db/init.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "dotenv": "^16.4.5",
+    "axios": "^1.7.7",
+    "ws": "^8.18.0",
+    "ioredis": "^5.4.1",
+    "razorpay": "^2.9.4",
+    "multer": "^1.4.5-lts.1",
+    "uuid": "^9.0.1",
+    "node-cron": "^3.0.3",
+    "helmet": "^7.1.0",
+    "cors": "^2.8.5",
+    "express-rate-limit": "^7.4.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  }
+}

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>BusGo — Select seats</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<div id="nav"></div>
+
+<div class="container" style="max-width:700px;">
+  <a href="/search.html">← Back to search</a>
+  <h1 id="tripTitle">Loading trip…</h1>
+  <p class="subtitle" id="tripSubtitle"></p>
+
+  <div class="card">
+    <h2>Select your seats</h2>
+    <div style="display:flex; gap:16px; font-size:0.8rem; color:var(--muted); margin-bottom:10px;">
+      <span><span class="seat" style="display:inline-block; width:16px; height:16px; vertical-align:middle;"></span> Available</span>
+      <span><span class="seat booked" style="display:inline-block; width:16px; height:16px; vertical-align:middle;"></span> Booked</span>
+      <span><span class="seat selected" style="display:inline-block; width:16px; height:16px; vertical-align:middle;"></span> Selected</span>
+    </div>
+    <div id="seatGrid" class="seat-grid"></div>
+    <div id="seatMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Fare</h2>
+    <div id="fareBreakdown" style="font-size:0.95rem;"></div>
+    <button id="payBtn" onclick="startPayment()" disabled>Select seats to continue</button>
+    <div id="payMsg"></div>
+    <p class="footer-note" style="margin-top:14px; text-align:left;">
+      Cancellation policy: 75% refund of the paid fare if you cancel a confirmed booking.
+    </p>
+  </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script src="/js/config.js"></script>
+<script>
+if (!requireUserAuth()) { /* redirected */ }
+renderNav('search');
+
+const params = new URLSearchParams(location.search);
+const tripId = params.get('tripId');
+let trip = null;
+let selectedSeats = new Set();
+let currentBooking = null; // { bookingId, holderId, seatIds, razorpayOrder }
+
+if (!tripId) {
+  document.getElementById('tripTitle').innerText = 'No trip selected';
+} else {
+  loadSeats();
+}
+
+async function loadSeats() {
+  try {
+    const data = await api(`/api/bookings/trip/${tripId}/seats`);
+    trip = data.trip;
+    document.getElementById('tripTitle').innerText = `Bus ${trip.registration_number || ''}`.trim();
+    document.getElementById('tripSubtitle').innerText =
+      `${trip.travel_date} · departs ${trip.departure_time} · current price ₹${trip.current_price}/seat`;
+
+    const grid = document.getElementById('seatGrid');
+    grid.innerHTML = '';
+    data.seats.forEach(seat => {
+      const div = document.createElement('div');
+      div.className = 'seat' + (seat.booked ? ' booked' : '');
+      div.innerText = seat.seat_number;
+      div.dataset.seatId = seat.id;
+      if (!seat.booked) {
+        div.onclick = () => toggleSeat(seat.id, div);
+      }
+      grid.appendChild(div);
+    });
+    updateFare();
+  } catch (e) {
+    statusMsg(document.getElementById('seatMsg'), e.message, 'error');
+  }
+}
+
+function toggleSeat(seatId, el) {
+  if (selectedSeats.has(seatId)) {
+    selectedSeats.delete(seatId);
+    el.classList.remove('selected');
+  } else {
+    selectedSeats.add(seatId);
+    el.classList.add('selected');
+  }
+  updateFare();
+}
+
+function updateFare() {
+  const box = document.getElementById('fareBreakdown');
+  const payBtn = document.getElementById('payBtn');
+  const count = selectedSeats.size;
+
+  if (count === 0) {
+    box.innerHTML = `<p style="color:var(--muted);">No seats selected yet.</p>`;
+    payBtn.disabled = true;
+    payBtn.innerText = 'Select seats to continue';
+    return;
+  }
+
+  const total = trip.current_price * count;
+  box.innerHTML = `
+    <div style="display:flex; justify-content:space-between;"><span>${count} seat(s) × ₹${trip.current_price}</span><span>₹${total}</span></div>
+    <hr style="border:none; border-top:1px solid var(--border); margin:10px 0;">
+    <div style="display:flex; justify-content:space-between; font-weight:700;"><span>Total</span><span>₹${total}</span></div>
+    <p style="color:var(--muted); font-size:0.8rem;">Price updates roughly every 30 minutes based on demand, date, and seats remaining — it may change if you wait too long.</p>
+  `;
+  payBtn.disabled = false;
+  payBtn.innerText = `Pay ₹${total} and book`;
+}
+
+async function startPayment() {
+  const payMsg = document.getElementById('payMsg');
+  const payBtn = document.getElementById('payBtn');
+  payBtn.disabled = true;
+  payBtn.innerText = 'Holding your seats…';
+
+  try {
+    const config = await api('/api/config');
+    const result = await api('/api/bookings/initiate', {
+      method: 'POST',
+      body: JSON.stringify({ tripId, seatIds: Array.from(selectedSeats) }),
+    });
+    currentBooking = result;
+
+    if (!config.razorpayKeyId) {
+      statusMsg(payMsg, 'Razorpay is not configured on the server yet (RAZORPAY_KEY_ID missing in .env) — seats are held but payment can\'t be completed in this demo environment.', 'error');
+      payBtn.innerText = 'Payment unavailable';
+      return;
+    }
+
+    const rzp = new Razorpay({
+      key: config.razorpayKeyId,
+      amount: result.razorpayOrder.amount,
+      currency: 'INR',
+      name: 'BusGo',
+      description: `${selectedSeats.size} seat(s) — Trip ${tripId}`,
+      order_id: result.razorpayOrder.id,
+      handler: async function (response) {
+        await confirmBooking(response);
+      },
+      modal: {
+        ondismiss: function () {
+          statusMsg(payMsg, 'Payment cancelled — your seat hold will expire in a few minutes.', 'error');
+          payBtn.disabled = false;
+          payBtn.innerText = `Pay ₹${trip.current_price * selectedSeats.size} and book`;
+        },
+      },
+      theme: { color: '#0b5fff' },
+    });
+    rzp.open();
+    payBtn.innerText = 'Waiting for payment…';
+  } catch (e) {
+    statusMsg(payMsg, e.message, 'error');
+    payBtn.disabled = false;
+    updateFare();
+  }
+}
+
+async function confirmBooking(razorpayResponse) {
+  const payMsg = document.getElementById('payMsg');
+  try {
+    const result = await api('/api/bookings/confirm', {
+      method: 'POST',
+      body: JSON.stringify({
+        bookingId: currentBooking.bookingId,
+        holderId: currentBooking.holderId,
+        seatIds: currentBooking.seatIds,
+        razorpay_order_id: razorpayResponse.razorpay_order_id,
+        razorpay_payment_id: razorpayResponse.razorpay_payment_id,
+        razorpay_signature: razorpayResponse.razorpay_signature,
+      }),
+    });
+    statusMsg(payMsg, 'Booking confirmed! Redirecting to your bookings…', 'success');
+    setTimeout(() => location.href = `/bookings.html`, 800);
+  } catch (e) {
+    statusMsg(payMsg, `Payment succeeded but booking confirmation failed: ${e.message}. Contact support with booking ID ${currentBooking.bookingId}.`, 'error');
+  }
+}
+</script>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</body>
+</html>

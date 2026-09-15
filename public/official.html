@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>BusGo — Official Portal</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/css/style.css" />
+<style>
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; }
+  .id-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 3px 8px; font-family: monospace; font-size: 0.78rem; }
+  .id-chip button { width: auto; padding: 2px 7px; font-size: 0.7rem; margin: 0; }
+  .empty-state { color: var(--muted); padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div id="navPlaceholder"></div>
+
+<div class="container" style="max-width:900px;">
+  <div id="loginSection">
+    <h1>🛂 Official Portal</h1>
+    <p class="subtitle">Log in with your phone, OTP, and your region's security access key.</p>
+
+    <div class="card">
+      <div id="stepPhone">
+        <label>Phone number</label>
+        <input id="phone" placeholder="Registered official phone number" />
+        <button onclick="requestOtp()">Send OTP</button>
+      </div>
+      <div id="stepOtp" style="display:none;">
+        <label>OTP</label>
+        <input id="otp" maxlength="6" />
+        <label>Security access key</label>
+        <input id="accessKey" type="password" placeholder="Your region's security access key" />
+        <button onclick="verifyOtp()">Log in</button>
+      </div>
+      <div id="loginMsg"></div>
+    </div>
+
+    <details class="card">
+      <summary style="cursor:pointer; font-weight:600;">First time setup — create the first region + super admin</summary>
+      <p class="subtitle">Run this once, using the SUPER_ADMIN_SETUP_KEY from your server's .env file.</p>
+      <label>Setup key</label>
+      <input id="setupKey" placeholder="SUPER_ADMIN_SETUP_KEY from .env" />
+      <div class="grid-2">
+        <div><label>Region code</label><input id="regionCode" placeholder="e.g. WB-01" /></div>
+        <div><label>Region name</label><input id="regionName" placeholder="e.g. West Bengal - Burdwan" /></div>
+      </div>
+      <label>Admin name</label>
+      <input id="adminName" />
+      <div class="grid-2">
+        <div><label>Admin phone</label><input id="adminPhone" /></div>
+        <div><label>Admin security access key</label><input id="adminAccessKey" type="password" placeholder="Choose a strong key" /></div>
+      </div>
+      <button onclick="bootstrap()">Create region + super admin</button>
+      <div id="bootstrapMsg"></div>
+    </details>
+  </div>
+
+  <div id="dashboard" style="display:none;">
+    <h1>Region dashboard</h1>
+    <p class="subtitle" id="officialInfo"></p>
+
+    <div class="tabs">
+      <button class="active" data-tab="overview" onclick="showTab('overview')">My region</button>
+      <button data-tab="drivers" onclick="showTab('drivers')">Register driver</button>
+      <button data-tab="buses" onclick="showTab('buses')">Register bus</button>
+      <button data-tab="routes" onclick="showTab('routes')">Create route</button>
+      <button data-tab="trips" onclick="showTab('trips')">Schedule trip</button>
+      <button data-tab="manage" onclick="showTab('manage')">Cancel route</button>
+    </div>
+
+    <!-- OVERVIEW: everything you've created, with copyable IDs -->
+    <div id="tab-overview" class="tab-content">
+      <div class="card">
+        <h2>Drivers</h2>
+        <div id="driversTable"><p class="empty-state">Loading…</p></div>
+      </div>
+      <div class="card">
+        <h2>Buses</h2>
+        <div id="busesTable"><p class="empty-state">Loading…</p></div>
+      </div>
+      <div class="card">
+        <h2>Routes</h2>
+        <div id="routesTable"><p class="empty-state">Loading…</p></div>
+      </div>
+      <div class="card">
+        <h2>Trips</h2>
+        <div id="tripsTable"><p class="empty-state">Loading…</p></div>
+      </div>
+    </div>
+
+    <div id="tab-drivers" class="tab-content" style="display:none;">
+      <div class="card">
+        <h2>Register a driver</h2>
+        <p class="subtitle">PAN and Aadhaar are checked against API Setu (sandbox, demo-grade) — real production KYC needs licensed access.</p>
+        <div class="grid-2">
+          <div><label>Full name</label><input id="dName" /></div>
+          <div><label>Phone number</label><input id="dPhone" /></div>
+        </div>
+        <div class="grid-2">
+          <div><label>PAN number</label><input id="dPan" placeholder="ABCDE1234F" /></div>
+          <div><label>Aadhaar number</label><input id="dAadhaar" placeholder="12-digit number" /></div>
+        </div>
+        <div class="grid-3">
+          <div><label>PAN image</label><input id="dPanImg" type="file" accept="image/*" /></div>
+          <div><label>Aadhaar image</label><input id="dAadhaarImg" type="file" accept="image/*" /></div>
+          <div><label>Selfie</label><input id="dSelfieImg" type="file" accept="image/*" /></div>
+        </div>
+        <button onclick="registerDriver()">Register & verify driver</button>
+        <div id="driverMsg"></div>
+      </div>
+    </div>
+
+    <div id="tab-buses" class="tab-content" style="display:none;">
+      <div class="card">
+        <h2>Register a bus</h2>
+        <div class="grid-2">
+          <div><label>Registration number</label><input id="bReg" placeholder="e.g. WB-06-1234" /></div>
+          <div><label>Operator name</label><input id="bOperator" /></div>
+        </div>
+        <div class="grid-2">
+          <div><label>Bus type</label>
+            <select id="bType"><option value="seater">Seater</option><option value="sleeper">Sleeper</option><option value="ac">AC</option><option value="non_ac">Non-AC</option></select>
+          </div>
+          <div><label>Total seats</label><input id="bSeats" type="number" value="36" /></div>
+        </div>
+        <label>Assign driver(s) <span style="font-weight:400;">(only KYC-verified drivers can be assigned)</span></label>
+        <select id="bDrivers" multiple size="5"></select>
+        <button onclick="registerBus()">Register bus</button>
+        <div id="busMsg"></div>
+      </div>
+    </div>
+
+    <div id="tab-routes" class="tab-content" style="display:none;">
+      <div class="card">
+        <h2>Create a route</h2>
+        <p class="subtitle">Search for the origin/destination the same way passengers do.</p>
+        <div class="autocomplete-wrap">
+          <label>Origin</label>
+          <input id="rOriginInput" placeholder="Start typing…" autocomplete="off" />
+          <div id="rOriginSuggestions" class="suggestions"></div>
+        </div>
+        <div class="autocomplete-wrap">
+          <label>Destination</label>
+          <input id="rDestInput" placeholder="Start typing…" autocomplete="off" />
+          <div id="rDestSuggestions" class="suggestions"></div>
+        </div>
+        <div class="grid-2">
+          <div><label>Distance (km, optional)</label><input id="rDistance" type="number" /></div>
+          <div><label>Base duration (minutes, optional)</label><input id="rDuration" type="number" /></div>
+        </div>
+        <label>Operating days</label>
+        <div id="daysCheckboxes" style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;"></div>
+        <label>Departure time</label>
+        <input id="rDeparture" type="time" value="08:00" />
+        <button onclick="createRoute()">Create route</button>
+        <div id="routeMsg"></div>
+      </div>
+    </div>
+
+    <div id="tab-trips" class="tab-content" style="display:none;">
+      <div class="card">
+        <h2>Schedule a trip</h2>
+        <p class="subtitle">Pick a route and bus you've already created — no need to copy IDs by hand.</p>
+        <label>Route</label>
+        <select id="tRoute"></select>
+        <label>Bus</label>
+        <select id="tBus"></select>
+        <label>Driver (optional)</label>
+        <select id="tDriver"><option value="">— none —</option></select>
+        <div class="grid-2">
+          <div><label>Travel date</label><input id="tDate" type="date" /></div>
+          <div><label>Departure time</label><input id="tTime" type="time" value="08:00" /></div>
+        </div>
+        <label>Base price (₹)</label>
+        <input id="tPrice" type="number" value="500" />
+        <button onclick="createTrip()">Schedule trip</button>
+        <div id="tripMsg"></div>
+      </div>
+    </div>
+
+    <div id="tab-manage" class="tab-content" style="display:none;">
+      <div class="card">
+        <h2>Cancel a route</h2>
+        <p class="subtitle">This cancels the route and all its currently scheduled trips in your region.</p>
+        <label>Route</label>
+        <select id="cRoute"></select>
+        <label>Reason</label>
+        <input id="cReason" placeholder="e.g. road closure, bus withdrawn" />
+        <button class="danger" onclick="cancelRoute()">Cancel route</button>
+        <div id="cancelMsg"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script>
+if (Auth.getOfficialToken()) showDashboard(); else buildDaysCheckboxes();
+
+function buildDaysCheckboxes() {
+  const days = ['MON','TUE','WED','THU','FRI','SAT','SUN'];
+  const box = document.getElementById('daysCheckboxes');
+  if (!box) return;
+  box.innerHTML = days.map(d => `<label style="display:flex; align-items:center; gap:4px; font-weight:400;"><input type="checkbox" value="${d}" style="width:auto;"> ${d}</label>`).join('');
+}
+
+let currentPhone = '';
+
+async function requestOtp() {
+  const phone = document.getElementById('phone').value.trim();
+  const msg = document.getElementById('loginMsg');
+  try {
+    await api('/api/auth/official/request-otp', { method: 'POST', body: JSON.stringify({ phone }) });
+    currentPhone = phone;
+    document.getElementById('stepPhone').style.display = 'none';
+    document.getElementById('stepOtp').style.display = 'block';
+    statusMsg(msg, 'OTP sent (check server console in demo mode).', 'success');
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
+async function verifyOtp() {
+  const otp = document.getElementById('otp').value.trim();
+  const security_access_key = document.getElementById('accessKey').value;
+  const msg = document.getElementById('loginMsg');
+  try {
+    const data = await api('/api/auth/official/verify-otp', {
+      method: 'POST',
+      body: JSON.stringify({ phone: currentPhone, otp, security_access_key }),
+    });
+    Auth.setOfficial(data.token, data.official);
+    showDashboard();
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
+async function bootstrap() {
+  const msg = document.getElementById('bootstrapMsg');
+  try {
+    const body = {
+      setup_key: document.getElementById('setupKey').value,
+      region_code: document.getElementById('regionCode').value,
+      region_name: document.getElementById('regionName').value,
+      admin_name: document.getElementById('adminName').value,
+      admin_phone: document.getElementById('adminPhone').value,
+      admin_access_key: document.getElementById('adminAccessKey').value,
+    };
+    await api('/api/official/bootstrap', { method: 'POST', body: JSON.stringify(body) });
+    statusMsg(msg, 'Region + super admin created. You can now log in above with that phone + access key.', 'success');
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
+function showDashboard() {
+  const official = Auth.getOfficial();
+  document.getElementById('loginSection').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+  document.getElementById('officialInfo').innerText =
+    `Logged in as ${official.name} · Role: ${official.role} · Region: ${official.region_id}`;
+  document.getElementById('navPlaceholder').innerHTML =
+    `<div class="nav"><a class="brand" href="/official.html">🛂 BusGo Official</a>
+     <div class="links"><span class="user-chip">${official.name}</span>
+     <button class="logout" onclick="Auth.logoutOfficial()">Log out</button></div></div>`;
+  buildDaysCheckboxes();
+  wireRouteAutocomplete();
+  loadOverview();
+  document.getElementById('tDate').valueAsDate = new Date();
+}
+
+function showTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.style.display = 'none');
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).style.display = 'block';
+  document.querySelector(`.tabs button[data-tab="${name}"]`).classList.add('active');
+  if (name === 'overview') loadOverview();
+  if (name === 'buses') populateDriverPicker();
+  if (name === 'trips' || name === 'manage') populateRouteBusPickers();
+}
+
+function copyId(id, btn) {
+  navigator.clipboard.writeText(id);
+  const old = btn.innerText;
+  btn.innerText = 'Copied!';
+  setTimeout(() => btn.innerText = old, 1200);
+}
+function idChip(id) {
+  return `<span class="id-chip">${id.slice(0, 8)}… <button class="small secondary" onclick="copyId('${id}', this)">Copy</button></span>`;
+}
+
+async function overrideKyc(driverId, status) {
+  if (!confirm(`Manually mark this driver as "${status}"? Use this when real KYC verification isn't reachable.`)) return;
+  try {
+    await api(`/api/official/drivers/${driverId}/kyc-override`, {
+      method: 'POST',
+      body: JSON.stringify({ status, note: 'manual override from dashboard' }),
+    }, 'official');
+    loadOverview();
+  } catch (e) { alert(e.message); }
+}
+
+/* ---------- Overview tab: everything you've created, with copy buttons ---------- */
+async function loadOverview() {
+  try {
+    const { drivers } = await api('/api/official/drivers', {}, 'official');
+    document.getElementById('driversTable').innerHTML = drivers.length === 0
+      ? `<p class="empty-state">No drivers registered yet.</p>`
+      : `<table><tr><th>Name</th><th>Phone</th><th>KYC</th><th>ID</th><th>Override</th></tr>${drivers.map(d => `
+          <tr><td>${d.name}</td><td>${d.phone}</td>
+          <td><span class="badge ${d.kyc_status === 'verified' ? 'green' : d.kyc_status === 'rejected' ? 'red' : 'amber'}">${d.kyc_status}</span></td>
+          <td>${idChip(d.id)}</td>
+          <td>
+            ${d.kyc_status !== 'verified' ? `<button class="small secondary" onclick="overrideKyc('${d.id}','verified')">Mark verified</button>` : ''}
+            ${d.kyc_status !== 'rejected' ? `<button class="small danger" onclick="overrideKyc('${d.id}','rejected')">Mark rejected</button>` : ''}
+          </td></tr>`).join('')}</table>`;
+  } catch (e) { document.getElementById('driversTable').innerHTML = `<p class="empty-state">${e.message}</p>`; }
+
+  try {
+    const { buses } = await api('/api/official/buses', {}, 'official');
+    document.getElementById('busesTable').innerHTML = buses.length === 0
+      ? `<p class="empty-state">No buses registered yet.</p>`
+      : `<table><tr><th>Registration</th><th>Operator</th><th>Type</th><th>Seats</th><th>ID</th></tr>${buses.map(b => `
+          <tr><td>${b.registration_number}</td><td>${b.operator_name || '—'}</td><td>${b.bus_type}</td><td>${b.total_seats}</td>
+          <td>${idChip(b.id)}</td></tr>`).join('')}</table>`;
+  } catch (e) { document.getElementById('busesTable').innerHTML = `<p class="empty-state">${e.message}</p>`; }
+
+  try {
+    const { routes } = await api('/api/official/routes', {}, 'official');
+    document.getElementById('routesTable').innerHTML = routes.length === 0
+      ? `<p class="empty-state">No routes created yet.</p>`
+      : `<table><tr><th>Route</th><th>Status</th><th>ID</th></tr>${routes.map(r => `
+          <tr><td>${r.origin_name} → ${r.destination_name}</td>
+          <td>${r.is_cancelled ? '<span class="badge red">Cancelled</span>' : '<span class="badge green">Active</span>'}</td>
+          <td>${idChip(r.id)}</td></tr>`).join('')}</table>`;
+  } catch (e) { document.getElementById('routesTable').innerHTML = `<p class="empty-state">${e.message}</p>`; }
+
+  try {
+    const { trips } = await api('/api/official/trips', {}, 'official');
+    document.getElementById('tripsTable').innerHTML = trips.length === 0
+      ? `<p class="empty-state">No trips scheduled yet.</p>`
+      : `<table><tr><th>Route</th><th>Bus</th><th>Date</th><th>Status</th><th>Price</th></tr>${trips.map(t => `
+          <tr><td>${t.origin_name} → ${t.destination_name}</td><td>${t.registration_number}</td>
+          <td>${t.travel_date} ${t.departure_time}</td><td><span class="badge">${t.status}</span></td><td>₹${t.current_price}</td></tr>`).join('')}</table>`;
+  } catch (e) { document.getElementById('tripsTable').innerHTML = `<p class="empty-state">${e.message}</p>`; }
+}
+
+/* ---------- Driver registration ---------- */
+async function registerDriver() {
+  const msg = document.getElementById('driverMsg');
+  statusMsg(msg, 'Registering and verifying — this can take a few seconds…', 'info');
+  const fd = new FormData();
+  fd.append('name', document.getElementById('dName').value);
+  fd.append('phone', document.getElementById('dPhone').value);
+  fd.append('pan_number', document.getElementById('dPan').value);
+  fd.append('aadhaar_number', document.getElementById('dAadhaar').value);
+  const panImg = document.getElementById('dPanImg').files[0];
+  const aadhaarImg = document.getElementById('dAadhaarImg').files[0];
+  const selfieImg = document.getElementById('dSelfieImg').files[0];
+  if (panImg) fd.append('pan_image', panImg);
+  if (aadhaarImg) fd.append('aadhaar_image', aadhaarImg);
+  if (selfieImg) fd.append('selfie_image', selfieImg);
+
+  try {
+    const data = await api('/api/official/drivers', { method: 'POST', body: fd }, 'official');
+    statusMsg(msg, `Driver registered — ID: ${data.driverId} · KYC status: ${data.kyc_status}.${data.note ? ' ' + data.note : ''} It now appears in "My region" → Drivers.`,
+      data.kyc_status === 'verified' ? 'success' : 'info');
+    loadOverview();
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
+/* ---------- Bus registration ---------- */
+async function populateDriverPicker() {
+  const select = document.getElementById('bDrivers');
+  select.innerHTML = '<option>Loading…</option>';
+  try {
+    const { drivers } = await api('/api/official/drivers', {}, 'official');
+    const verified = drivers.filter(d => d.kyc_status === 'verified');
+    select.innerHTML = verified.length === 0
+      ? '<option disabled>No KYC-verified drivers yet — register one first</option>'
+      : verified.map(d => `<option value="${d.id}">${d.name} (${d.phone})</option>`).join('');
+  } catch (e) { select.innerHTML = `<option disabled>${e.message}</option>`; }
+}
+
+async function registerBus() {
+  const msg = document.getElementById('busMsg');
+  const driverIds = Array.from(document.getElementById('bDrivers').selectedOptions).map(o => o.value);
+  try {
+    const data = await api('/api/official/buses', {
+      method: 'POST',
+      body: JSON.stringify({
+        registration_number: document.getElementById('bReg').value,
+        operator_name: document.getElementById('bOperator').value,
+        bus_type: document.getElementById('bType').value,
+        total_seats: Number(document.getElementById('bSeats').value),
+        driver_ids: driverIds,
+      }),
+    }, 'official');
+    statusMsg(msg, `Bus registered — ID: ${data.busId}. It now appears in "My region" → Buses, and in the trip-scheduling dropdown.`, 'success');
+    loadOverview();
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
+/* ---------- Route creation (with location autocomplete, falls back to manual entry) ---------- */
+let rOrigin = null, rDest = null;
+function wireRouteAutocomplete() {
+  wireAutocompleteWithFallback('rOriginInput', 'rOriginSuggestions', loc => rOrigin = loc);
+  wireAutocompleteWithFallback('rDestInput', 'rDestSuggestions', loc => rDest = loc);
+}
+
+async function createRoute() {
+  const msg = document.getElementById('routeMsg');
+  if (!rOrigin || !rDest) { statusMsg(msg, 'Pick origin and destination from the suggestions.', 'error'); return; }
+  const days = Array.from(document.querySelectorAll('#daysCheckboxes input:checked')).map(c => c.value);
+
+  try {
+    const data = await api('/api/official/routes', {
+      method: 'POST',
+      body: JSON.stringify({
+        origin_location_id: rOrigin.id,
+        destination_location_id: rDest.id,
+        distance_km: document.getElementById('rDistance').value ? Number(document.getElementById('rDistance').value) : null,
+        base_duration_min: document.getElementById('rDuration').value ? Number(document.getElementById('rDuration').value) : null,
+        schedule: days.length > 0 ? [{ days_of_week: days.join(','), departure_time: document.getElementById('rDeparture').value }] : [],
+      }),
+    }, 'official');
+    statusMsg(msg, `Route created — ID: ${data.routeId}. It now appears in "My region" → Routes, and in the trip-scheduling dropdown.`, 'success');
+    loadOverview();
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
+/* ---------- Trip scheduling + cancel: dropdown pickers instead of pasted IDs ---------- */
+async function populateRouteBusPickers() {
+  try {
+    const { routes } = await api('/api/official/routes', {}, 'official');
+    const active = routes.filter(r => !r.is_cancelled);
+    const opts = active.length === 0
+      ? '<option disabled>No routes yet — create one first</option>'
+      : active.map(r => `<option value="${r.id}">${r.origin_name} → ${r.destination_name}</option>`).join('');
+    const tRoute = document.getElementById('tRoute'); if (tRoute) tRoute.innerHTML = opts;
+    const cRoute = document.getElementById('cRoute'); if (cRoute) cRoute.innerHTML = opts;
+  } catch (e) { /* ignore */ }
+
+  try {
+    const { buses } = await api('/api/official/buses', {}, 'official');
+    const tBus = document.getElementById('tBus');
+    if (tBus) tBus.innerHTML = buses.length === 0
+      ? '<option disabled>No buses yet — register one first</option>'
+      : buses.map(b => `<option value="${b.id}">${b.registration_number} — ${b.operator_name || 'operator'} (${b.total_seats} seats)</option>`).join('');
+  } catch (e) { /* ignore */ }
+
+  try {
+    const { drivers } = await api('/api/official/drivers', {}, 'official');
+    const verified = drivers.filter(d => d.kyc_status === 'verified');
+    const tDriver = document.getElementById('tDriver');
+    if (tDriver) tDriver.innerHTML = '<option value="">— none —</option>' + verified.map(d => `<option value="${d.id}">${d.name}</option>`).join('');
+  } catch (e) { /* ignore */ }
+}
+
+async function createTrip() {
+  const msg = document.getElementById('tripMsg');
+  const routeId = document.getElementById('tRoute').value;
+  const busId = document.getElementById('tBus').value;
+  if (!routeId || !busId) { statusMsg(msg, 'Pick a route and a bus (create one first if the list is empty).', 'error'); return; }
+  try {
+    const data = await api('/api/official/trips', {
+      method: 'POST',
+      body: JSON.stringify({
+        route_id: routeId,
+        bus_id: busId,
+        driver_id: document.getElementById('tDriver').value || null,
+        travel_date: document.getElementById('tDate').value,
+        departure_time: document.getElementById('tTime').value,
+        base_price: Number(document.getElementById('tPrice').value),
+      }),
+    }, 'official');
+    statusMsg(msg, `Trip scheduled — ID: ${data.tripId}. Passengers can now find and book it in search.`, 'success');
+    loadOverview();
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+
+async function cancelRoute() {
+  const msg = document.getElementById('cancelMsg');
+  const routeId = document.getElementById('cRoute').value;
+  if (!routeId) { statusMsg(msg, 'Pick a route to cancel.', 'error'); return; }
+  try {
+    await api(`/api/official/routes/${routeId}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({ reason: document.getElementById('cReason').value }),
+    }, 'official');
+    statusMsg(msg, 'Route and its scheduled trips have been cancelled.', 'success');
+    loadOverview();
+    populateRouteBusPickers();
+  } catch (e) { statusMsg(msg, e.message, 'error'); }
+}
+</script>
+</body>
+</html>

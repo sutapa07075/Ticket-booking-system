@@ -1,0 +1,4 @@
+.env
+node_modules/
+# config.js under public/js/ there it is used to store the google map api key.
+public/js/config.js 

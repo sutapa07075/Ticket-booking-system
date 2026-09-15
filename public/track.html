@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>BusGo — Live tracking</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/css/style.css" />
+<style>
+  body { overflow: hidden; }
+  #map { height: calc(100vh - 60px); width: 100%; }
+  .float-status {
+    position: absolute; top: 76px; left: 20px; background: white; padding: 10px 16px;
+    border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); z-index: 10; font-size: 0.88rem;
+  }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:7px; }
+  .live { background:#16a34a; } .offline { background:#dc2626; }
+</style>
+</head>
+<body>
+<div id="nav"></div>
+<div class="float-status"><span class="dot offline" id="statusDot"></span><span id="statusText">Connecting…</span></div>
+<div id="map"></div>
+
+<script src="/js/common.js"></script>
+<script src="/js/config.js"></script>
+<script>
+if (!requireUserAuth()) { /* redirected */ }
+renderNav('search');
+
+const params = new URLSearchParams(location.search);
+const tripId = params.get('tripId');
+
+if (!tripId) {
+  alert('No trip selected — pick a bus from search first.');
+  location.href = '/search.html';
+}
+
+let map, busMarker, pathLine, ws;
+const pathCoords = [];
+let mapAvailable = true;
+
+function initMap() {
+  try {
+    map = new google.maps.Map(document.getElementById('map'), { center: { lat: 22.5726, lng: 88.3639 }, zoom: 10 });
+    busMarker = new google.maps.Marker({
+      map,
+      icon: { path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW, scale: 6, fillColor: '#0b5fff', fillOpacity: 1, strokeWeight: 1 },
+    });
+    pathLine = new google.maps.Polyline({ map, strokeColor: '#0b5fff', strokeOpacity: 0.8, strokeWeight: 3 });
+  } catch (e) {
+    console.warn('Map failed to initialize, falling back to text feed:', e.message);
+    showFallbackFeed();
+  }
+
+  loadHistory();
+  connectWebSocket();
+}
+
+// If the Maps JS API isn't usable on this key, still show live coordinates
+// as plain text so tracking data is never entirely lost to the user.
+function showFallbackFeed() {
+  mapAvailable = false;
+  document.getElementById('map').innerHTML = `
+    <div style="padding:30px; text-align:center;">
+      <p style="color:var(--muted);">Map preview isn't available (check your Google Maps API key/billing) — showing live coordinates instead.</p>
+      <div id="fallbackCoords" style="font-family:monospace; font-size:1.3rem; margin-top:16px;">Waiting for GPS…</div>
+    </div>`;
+}
+
+window.gm_authFailure = showFallbackFeed;
+
+async function loadHistory() {
+  try {
+    const data = await api(`/api/tracking/${tripId}/history`);
+    (data.points || []).forEach(p => pathCoords.push({ lat: p.lat, lng: p.lng }));
+    pathLine.setPath(pathCoords);
+    if (pathCoords.length > 0) {
+      const last = pathCoords[pathCoords.length - 1];
+      map.setCenter(last);
+      busMarker.setPosition(last);
+    }
+  } catch (e) { /* no history yet, fine */ }
+
+  try {
+    const latest = await api(`/api/tracking/${tripId}/latest`);
+    updateBusPosition(latest.lat, latest.lng, latest.heading);
+  } catch (e) {
+    setStatus('offline', 'No live location yet — waiting for the driver to start sharing GPS.');
+  }
+}
+
+function connectWebSocket() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/track?tripId=${tripId}&role=passenger`);
+
+  ws.onopen = () => setStatus('live', 'Connected — waiting for live updates');
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'location') {
+      updateBusPosition(msg.lat, msg.lng, msg.heading);
+      setStatus('live', `Live · updated ${new Date(msg.ts).toLocaleTimeString()}`);
+    }
+  };
+  ws.onclose = () => { setStatus('offline', 'Disconnected — retrying…'); setTimeout(connectWebSocket, 3000); };
+  ws.onerror = () => setStatus('offline', 'Connection error');
+}
+
+function updateBusPosition(lat, lng, heading) {
+  const pos = { lat, lng };
+  busMarker.setPosition(pos);
+  pathCoords.push(pos);
+  pathLine.setPath(pathCoords);
+  map.panTo(pos);
+}
+
+function setStatus(cls, text) {
+  document.getElementById('statusDot').className = 'dot ' + cls;
+  document.getElementById('statusText').innerText = text;
+}
+
+const gmapScript = document.createElement('script');
+gmapScript.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_BROWSER_KEY}&callback=initMap&loading=async`;
+gmapScript.async = true; gmapScript.defer = true;
+document.body.appendChild(gmapScript);
+</script>
+</body>
+</html>

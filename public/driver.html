@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>BusGo — Driver GPS</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<div class="page-narrow">
+  <h1>🚍 Share live location</h1>
+  <p class="subtitle">Open this on the driver's phone while the bus is running. It reads device GPS and streams it to everyone tracking this trip.</p>
+
+  <div class="card">
+    <label>Trip ID</label>
+    <input id="tripId" placeholder="Paste the trip ID (an official can provide this)" />
+    <label>Login token (driver/official JWT)</label>
+    <input id="token" placeholder="Paste your token" />
+    <button onclick="start()">Start sharing location</button>
+    <button class="secondary" onclick="stop()">Stop</button>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Activity log</h2>
+    <div id="log" style="font-family:monospace; font-size:0.78rem; background:#f6f6f6; padding:10px; border-radius:6px; height:180px; overflow-y:auto;"></div>
+  </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script>
+let ws, watchId;
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.innerHTML = `${new Date().toLocaleTimeString()} — ${msg}<br>` + el.innerHTML;
+}
+
+function start() {
+  const tripId = document.getElementById('tripId').value.trim();
+  const token = document.getElementById('token').value.trim();
+  const msg = document.getElementById('msg');
+  if (!tripId || !token) { statusMsg(msg, 'Trip ID and token are required.', 'error'); return; }
+  msg.innerHTML = '';
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/track?tripId=${tripId}&role=driver&token=${token}`);
+
+  ws.onopen = () => {
+    log('Connected as driver. Starting GPS watch…');
+    statusMsg(msg, 'Sharing live location…', 'success');
+    if (!navigator.geolocation) { log('Geolocation not supported by this browser'); return; }
+
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const { latitude, longitude, speed, heading } = pos.coords;
+        const payload = { lat: latitude, lng: longitude, speed: speed || 0, heading: heading || 0 };
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(payload));
+          log(`Sent: ${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
+        }
+      },
+      (err) => log('GPS error: ' + err.message),
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 }
+    );
+  };
+
+  ws.onclose = () => { log('Disconnected'); statusMsg(msg, 'Disconnected.', 'error'); };
+  ws.onerror = () => log('WebSocket error');
+}
+
+function stop() {
+  if (watchId) navigator.geolocation.clearWatch(watchId);
+  if (ws) ws.close();
+  log('Stopped sharing location');
+}
+</script>
+</body>
+</html>

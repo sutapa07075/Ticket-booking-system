@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>BusGo — Search buses</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/css/style.css" />
+<style>
+  .layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div id="nav"></div>
+
+<div class="container">
+  <h1>Find your bus</h1>
+  <p class="subtitle">Search a route, see live pricing, and view the road route on the map before you book.</p>
+
+  <div class="layout">
+    <div>
+      <div class="card">
+        <div class="autocomplete-wrap">
+          <label>From</label>
+          <input id="originInput" placeholder="Start typing a city or place…" autocomplete="off" />
+          <div id="originSuggestions" class="suggestions"></div>
+        </div>
+        <div class="autocomplete-wrap">
+          <label>To</label>
+          <input id="destInput" placeholder="Start typing a city or place…" autocomplete="off" />
+          <div id="destSuggestions" class="suggestions"></div>
+        </div>
+        <label>Travel date</label>
+        <input id="dateInput" type="date" />
+        <button onclick="searchRoutes()">Search buses</button>
+        <div id="searchMsg"></div>
+      </div>
+
+      <div id="results"></div>
+    </div>
+
+    <div>
+      <div class="map-pane" id="map"></div>
+    </div>
+  </div>
+</div>
+
+<script src="/js/common.js"></script>
+<script src="/js/config.js"></script>
+<script>
+if (!requireUserAuth()) { /* redirected */ }
+renderNav('search');
+
+let origin = null, dest = null;
+let map, routePolyline, originMarker, destMarker;
+
+function initMap() {
+  try {
+    map = new google.maps.Map(document.getElementById('map'), {
+      center: { lat: 22.5726, lng: 88.3639 },
+      zoom: 6,
+      disableDefaultUI: true,
+      zoomControl: true,
+    });
+  } catch (e) {
+    console.warn('Map failed to initialize:', e.message);
+    showMapUnavailable('Map could not load — search still works, just without the visual route.');
+  }
+}
+
+function showMapUnavailable(text) {
+  const mapEl = document.getElementById('map');
+  mapEl.innerHTML = `<div style="height:100%; display:flex; align-items:center; justify-content:center; text-align:center; padding:20px; color:var(--muted); font-size:0.9rem;">${text}</div>`;
+}
+
+// If the Maps JS script itself fails to load at all (bad key, API not
+// enabled, network blocked), this fires and the page still works —
+// search results render normally, just no map preview.
+window.gm_authFailure = function () {
+  showMapUnavailable('Google Maps could not authenticate (check your API key / billing) — search still works below.');
+};
+
+wireAutocompleteWithFallback('originInput', 'originSuggestions', (loc) => origin = loc);
+wireAutocompleteWithFallback('destInput', 'destSuggestions', (loc) => dest = loc);
+
+document.getElementById('dateInput').valueAsDate = new Date();
+
+async function searchRoutes() {
+  const msg = document.getElementById('searchMsg');
+  if (!origin || !dest) { statusMsg(msg, 'Pick both a start and end location from the suggestions.', 'error'); return; }
+
+  const date = document.getElementById('dateInput').value;
+  msg.innerHTML = '';
+
+  try {
+    const data = await api(`/api/journey/search?origin=${origin.id}&destination=${dest.id}&date=${date}`);
+    renderResults(data);
+    if (map) drawDirections({ lat: origin.lat, lng: origin.lng }, { lat: dest.lat, lng: dest.lng });
+  } catch (e) {
+    statusMsg(msg, e.message, 'error');
+  }
+}
+
+function drawDirections(originLatLng, destLatLng) {
+  if (!map) return; // map failed to load — skip silently, results list still shown
+  if (originLatLng.lat == null || originLatLng.lng == null || destLatLng.lat == null || destLatLng.lng == null) {
+    return; // manually-entered locations have no coordinates — can't draw a route for them
+  }
+
+  // Clear any previous route/markers before drawing the new one
+  if (routePolyline) routePolyline.setMap(null);
+  if (originMarker) originMarker.setMap(null);
+  if (destMarker) destMarker.setMap(null);
+
+  api(`/api/places/route-preview?originLat=${originLatLng.lat}&originLng=${originLatLng.lng}&destLat=${destLatLng.lat}&destLng=${destLatLng.lng}`)
+    .then((route) => {
+      if (!route.encoded_polyline) return;
+      const path = decodePolyline(route.encoded_polyline);
+      routePolyline = new google.maps.Polyline({ map, path, strokeColor: '#0b5fff', strokeOpacity: 0.85, strokeWeight: 4 });
+
+      originMarker = new google.maps.Marker({ map, position: originLatLng, label: 'A' });
+      destMarker = new google.maps.Marker({ map, position: destLatLng, label: 'B' });
+
+      const bounds = new google.maps.LatLngBounds();
+      path.forEach((p) => bounds.extend(p));
+      map.fitBounds(bounds);
+    })
+    .catch((e) => console.warn('Route preview unavailable:', e.message));
+}
+
+// Decodes a Google encoded polyline string into an array of {lat, lng}
+// points — standard algorithm, no Google library dependency needed.
+function decodePolyline(encoded) {
+  let points = [], index = 0, lat = 0, lng = 0;
+  while (index < encoded.length) {
+    let b, shift = 0, result = 0;
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+    shift = 0; result = 0;
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+    points.push({ lat: lat / 1e5, lng: lng / 1e5 });
+  }
+  return points;
+}
+
+function renderResults(data) {
+  const box = document.getElementById('results');
+  box.innerHTML = '';
+
+  const hasDirect = data.direct && data.direct.length > 0;
+  const hasConnecting = data.connecting && data.connecting.length > 0;
+
+  if (hasDirect) {
+    box.innerHTML += `<h3>Direct routes</h3>`;
+    data.direct.forEach(d => {
+      if (d.trips.length === 0) {
+        box.innerHTML += `<div class="card"><small>A direct route exists but no bus is scheduled on this date.</small></div>`;
+      }
+      d.trips.forEach(t => box.innerHTML += tripCard(t));
+    });
+  }
+
+  if (hasConnecting) {
+    box.innerHTML += `<h3>Connecting routes <span class="badge amber">bus change required</span></h3>`;
+    data.connecting.forEach(c => {
+      box.innerHTML += `<div class="card">
+        <strong>Change buses en route</strong>
+        ${c.legs.map((leg, i) => `
+          <div style="margin-top:10px;">
+            <div class="badge">Leg ${i + 1}</div>
+            ${leg.trips.length > 0
+              ? leg.trips.map(t => tripCard(t)).join('')
+              : `<div><small>No bus scheduled on this leg for the chosen date.</small></div>`}
+          </div>`).join('')}
+      </div>`;
+    });
+  }
+
+  if (!hasDirect && !hasConnecting) {
+    box.innerHTML = `<div class="card"><p>No routes found for this date. Try a different date, or check back — officials add new routes regularly.</p></div>`;
+  }
+}
+
+function tripCard(trip) {
+  return `<div class="trip-card" onclick="location.href='/booking.html?tripId=${trip.id}'">
+    <div>
+      <strong>${trip.operator_name || 'Bus operator'}</strong> · ${trip.registration_number}<br>
+      <span class="badge">${trip.bus_type}</span>
+      <span class="badge green">${trip.total_seats} seats</span><br>
+      <small>Departs ${trip.departure_time}</small>
+    </div>
+    <div style="text-align:right;">
+      <div class="price">₹${trip.current_price}</div>
+      <small>Tap to select seats →</small>
+    </div>
+  </div>`;
+}
+</script>
+<script>
+  // Load the Maps script dynamically so it always uses the current key from config.js.
+  const gmapScript = document.createElement('script');
+  gmapScript.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_MAPS_BROWSER_KEY}&callback=initMap&loading=async`;
+  gmapScript.async = true;
+  gmapScript.defer = true;
+  gmapScript.onerror = () => showMapUnavailable('Could not load Google Maps — search still works below.');
+  document.body.appendChild(gmapScript);
+</script>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>BusGo — My bookings</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<div id="nav"></div>
+
+<div class="container" style="max-width:760px;">
+  <h1>My bookings</h1>
+  <p class="subtitle">Track a live bus, or cancel a confirmed booking (75% refund).</p>
+  <div id="list"></div>
+</div>
+
+<script src="/js/common.js"></script>
+<script>
+if (!requireUserAuth()) { /* redirected */ }
+renderNav('bookings');
+
+load();
+
+async function load() {
+  const list = document.getElementById('list');
+  try {
+    const { bookings } = await api('/api/bookings/mine');
+    if (bookings.length === 0) {
+      list.innerHTML = `<div class="card"><p>No bookings yet. <a href="/search.html">Search for a bus →</a></p></div>`;
+      return;
+    }
+    list.innerHTML = bookings.map(renderBooking).join('');
+  } catch (e) {
+    statusMsg(list, e.message, 'error');
+  }
+}
+
+function renderBooking(b) {
+  const statusBadge = {
+    confirmed: '<span class="badge green">Confirmed</span>',
+    pending_payment: '<span class="badge amber">Payment pending</span>',
+    cancelled: '<span class="badge red">Cancelled</span>',
+    completed: '<span class="badge">Completed</span>',
+  }[b.status] || '';
+
+  return `<div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+      <div>
+        <strong>${b.origin_name} → ${b.dest_name}</strong><br>
+        <small>${b.operator_name || ''} · ${b.registration_number} · ${b.travel_date} at ${b.departure_time}</small><br>
+        ${statusBadge}
+      </div>
+      <div style="text-align:right;">
+        <div style="font-weight:700;">₹${b.total_amount}</div>
+        ${b.refund_amount ? `<small>Refunded ₹${b.refund_amount}</small>` : ''}
+      </div>
+    </div>
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      ${b.status === 'confirmed' && b.trip_status === 'live'
+        ? `<button class="secondary small" onclick="location.href='/track.html?tripId=${b.trip_id}'">Track live location</button>`
+        : ''}
+      ${b.status === 'confirmed'
+        ? `<button class="danger small" onclick="cancelBooking('${b.booking_id}', this)">Cancel booking</button>`
+        : ''}
+    </div>
+  </div>`;
+}
+
+async function cancelBooking(bookingId, btn) {
+  if (!confirm('Cancel this booking? You will receive a 75% refund of the fare paid.')) return;
+  btn.disabled = true;
+  btn.innerText = 'Cancelling…';
+  try {
+    await api(`/api/bookings/${bookingId}/cancel`, { method: 'POST' });
+    load();
+  } catch (e) {
+    alert(e.message);
+    btn.disabled = false;
+    btn.innerText = 'Cancel booking';
+  }
+}
+</script>
+</body>
+</html>

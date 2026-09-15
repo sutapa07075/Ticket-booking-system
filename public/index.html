@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>BusGo — Log in</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<div class="page-narrow">
+  <h1>🚌 BusGo</h1>
+  <p class="subtitle">Log in with your phone number — we'll text you a one-time code.</p>
+
+  <div class="card">
+    <div id="stepPhone">
+      <label>Phone number</label>
+      <input id="phone" placeholder="e.g. 9876543210" />
+      <button onclick="requestOtp()">Send OTP</button>
+    </div>
+
+    <div id="stepOtp" style="display:none;">
+      <label>Enter the 6-digit code</label>
+      <input id="otp" placeholder="123456" maxlength="6" />
+      <label>Your name <span style="font-weight:400;">(only needed first time)</span></label>
+      <input id="name" placeholder="Full name" />
+      <button onclick="verifyOtp()">Verify & continue</button>
+      <button class="secondary" onclick="backToPhone()">Use a different number</button>
+    </div>
+
+    <div id="msg"></div>
+  </div>
+
+  <p class="footer-note">Are you a regional official? <a href="/official.html">Go to the official portal</a></p>
+</div>
+
+<script src="/js/common.js"></script>
+<script>
+// Already logged in? Skip straight to search.
+if (Auth.getUserToken()) location.href = '/search.html';
+
+let currentPhone = '';
+
+async function requestOtp() {
+  const phone = document.getElementById('phone').value.trim();
+  const msg = document.getElementById('msg');
+  if (!/^\+?[0-9]{10,15}$/.test(phone)) { statusMsg(msg, 'Enter a valid phone number.', 'error'); return; }
+
+  try {
+    await api('/api/auth/user/request-otp', { method: 'POST', body: JSON.stringify({ phone }) });
+    currentPhone = phone;
+    document.getElementById('stepPhone').style.display = 'none';
+    document.getElementById('stepOtp').style.display = 'block';
+    statusMsg(msg, `OTP sent to ${phone}. (Demo mode: check the server console for the code.)`, 'success');
+  } catch (e) {
+    statusMsg(msg, e.message, 'error');
+  }
+}
+
+async function verifyOtp() {
+  const otp = document.getElementById('otp').value.trim();
+  const name = document.getElementById('name').value.trim();
+  const msg = document.getElementById('msg');
+  if (!otp) { statusMsg(msg, 'Enter the OTP.', 'error'); return; }
+
+  try {
+    const data = await api('/api/auth/user/verify-otp', {
+      method: 'POST',
+      body: JSON.stringify({ phone: currentPhone, otp, name: name || undefined }),
+    });
+    Auth.setUser(data.token, data.user);
+    statusMsg(msg, 'Logged in! Redirecting…', 'success');
+    setTimeout(() => location.href = '/search.html', 500);
+  } catch (e) {
+    statusMsg(msg, e.message, 'error');
+  }
+}
+
+function backToPhone() {
+  document.getElementById('stepOtp').style.display = 'none';
+  document.getElementById('stepPhone').style.display = 'block';
+}
+</script>
+</body>
+</html>
